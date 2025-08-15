@@ -29,25 +29,42 @@ steps:
       Write-Host "Selecionado: $picked -> $dest"
 
 - task: PowerShell@2
+  displayName: 'Gerar deployment.settings.json (PAC CLI)'
   inputs:
     targetType: 'inline'
     script: |
+      $ErrorActionPreference = 'Stop'
+
+      # Garante PATH do dotnet tools no pwsh (Ubuntu)
+      $dotnetTools = "$HOME/.dotnet/tools"
+      if (-not ($env:PATH -split ':' | Where-Object { $_ -eq $dotnetTools })) {
+        $env:PATH = "$env:PATH:$dotnetTools"
+      }
+
       # Caminhos
-      $zip = "$(SolutionZip)"  # você já tem essa variável da etapa que escolhe/renomeia o .zip
+      $zip = "$(SolutionZip)"
       $out = "$(Build.ArtifactStagingDirectory)/deployment.settings.json"
-      
-      # Gera o template de settings (EVs + Connection References) a partir do ZIP
-      pac solution create-settings --solution-zip $zip --settings-file $out
-      
+
+      # PAC pode estar fora do PATH; chama direto se existir
+      $pac = Join-Path $dotnetTools 'pac'
+      if (-not (Test-Path $pac)) { $pac = 'pac' }  # fallback
+
+      & $pac --version
+      & $pac solution create-settings --solution-zip $zip --settings-file $out
+
       Write-Host "##vso[task.setvariable variable=DeploymentSettingsFile]$out"
       Write-Host "Gerado: $out"
 
 
+
 - task: PowerPlatformImportSolution@2
+  displayName: 'Import Solution (com settings)'
   inputs:
     authenticationType: 'PowerPlatformSPN'
     PowerPlatformSPN: 'Teste-Pipeline-PowerAutomate'
     SolutionInputFile: '$(SolutionZip)'
+    UseDeploymentSettingsFile: true
+    DeploymentSettingsFile: '$(DeploymentSettingsFile)'
     AsyncOperation: true
     MaxAsyncWaitTime: '60'
     StageAndUpgrade: false
