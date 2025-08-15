@@ -28,6 +28,20 @@ steps:
       Write-Host "##vso[task.setvariable variable=SolutionZip]$dest"
       Write-Host "Selecionado: $picked -> $dest"
 
+- task: PowerShell@2
+  inputs:
+    targetType: 'inline'
+    script: |
+      # Caminhos
+      $zip = "$(SolutionZip)"  # você já tem essa variável da etapa que escolhe/renomeia o .zip
+      $out = "$(Build.ArtifactStagingDirectory)/deployment.settings.json"
+      
+      # Gera o template de settings (EVs + Connection References) a partir do ZIP
+      pac solution create-settings --solution-zip $zip --settings-file $out
+      
+      Write-Host "##vso[task.setvariable variable=DeploymentSettingsFile]$out"
+      Write-Host "Gerado: $out"
+
 
 - task: PowerPlatformImportSolution@2
   inputs:
