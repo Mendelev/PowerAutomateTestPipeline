@@ -1,20 +1,20 @@
-# Starter pipeline
-# Start with a minimal pipeline that you can customize to build and deploy your code.
-# Add steps that build, run tests, deploy, and more:
-# https://aka.ms/yaml
-
 trigger:
 - main
 
 pool:
-  vmImage: ubuntu-latest
+  vmImage: ubuntu-latest   # ou windows-latest
 
 steps:
+# 1) Instala e adiciona PAC ao PATH
 - task: PowerPlatformToolInstaller@2
+  displayName: 'Power Platform Tool Installer'
   inputs:
     DefaultVersion: true
+    AddToolsToPath: true    # << ESSENCIAL p/ 'pac' no PATH
 
+# 2) Seleciona o ZIP mais recente e define $(SolutionZip)
 - task: PowerShell@2
+  displayName: 'Selecionar ZIP'
   inputs:
     targetType: 'inline'
     script: |
@@ -28,27 +28,21 @@ steps:
       Write-Host "##vso[task.setvariable variable=SolutionZip]$dest"
       Write-Host "Selecionado: $picked -> $dest"
 
-- task: Bash@3
+# 3) Gera o deployment.settings.json com PAC
+- task: PowerShell@2
   displayName: 'Gerar deployment.settings.json (PAC CLI)'
   inputs:
     targetType: 'inline'
     script: |
-      set -euo pipefail
-      # Garante PATH do dotnet tools
-      export PATH="$PATH:$HOME/.dotnet/tools"
-
-      zip="$(SolutionZip)"
-      out="$(Build.ArtifactStagingDirectory)/deployment.settings.json"
-
+      $ErrorActionPreference = 'Stop'
       pac --version
-      pac solution create-settings --solution-zip "$zip" --settings-file "$out"
+      $zip = "$(SolutionZip)"
+      $out = "$(Build.ArtifactStagingDirectory)/deployment.settings.json"
+      pac solution create-settings --solution-zip $zip --settings-file $out
+      Write-Host "##vso[task.setvariable variable=DeploymentSettingsFile]$out"
+      Write-Host "Gerado: $out"
 
-      echo "##vso[task.setvariable variable=DeploymentSettingsFile]$out"
-      echo "Gerado: $out"
-
-
-
-
+# 4) Importa usando o settings file
 - task: PowerPlatformImportSolution@2
   displayName: 'Import Solution (com settings)'
   inputs:
