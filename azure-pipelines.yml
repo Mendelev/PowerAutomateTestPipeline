@@ -36,4 +36,4 @@ steps:
     SolutionInputFile: '$(SolutionZip)'
     AsyncOperation: true
     MaxAsyncWaitTime: '60'
-    StageAndUpgrade: true
+    StageAndUpgrade: false
