@@ -7,7 +7,7 @@ trigger:
 - main
 
 pool:
-  vmImage: windows-latest
+  vmImage: ubuntu-latest
 
 steps:
 - task: PowerPlatformToolInstaller@2
@@ -28,32 +28,24 @@ steps:
       Write-Host "##vso[task.setvariable variable=SolutionZip]$dest"
       Write-Host "Selecionado: $picked -> $dest"
 
-- task: PowerShell@2
+- task: Bash@3
   displayName: 'Gerar deployment.settings.json (PAC CLI)'
   inputs:
     targetType: 'inline'
     script: |
-      $ErrorActionPreference = 'Stop'
+      set -euo pipefail
+      # Garante PATH do dotnet tools
+      export PATH="$PATH:$HOME/.dotnet/tools"
 
-      # Garante PATH do dotnet tools no pwsh (Ubuntu)
-      $dotnetTools = "$HOME/.dotnet/tools"
-      if (-not ($env:PATH -split ':' | Where-Object { $_ -eq $dotnetTools })) {
-        $env:PATH = "$env:PATH:$dotnetTools"
-      }
+      zip="$(SolutionZip)"
+      out="$(Build.ArtifactStagingDirectory)/deployment.settings.json"
 
-      # Caminhos
-      $zip = "$(SolutionZip)"
-      $out = "$(Build.ArtifactStagingDirectory)/deployment.settings.json"
+      pac --version
+      pac solution create-settings --solution-zip "$zip" --settings-file "$out"
 
-      # PAC pode estar fora do PATH; chama direto se existir
-      $pac = Join-Path $dotnetTools 'pac'
-      if (-not (Test-Path $pac)) { $pac = 'pac' }  # fallback
+      echo "##vso[task.setvariable variable=DeploymentSettingsFile]$out"
+      echo "Gerado: $out"
 
-      & $pac --version
-      & $pac solution create-settings --solution-zip $zip --settings-file $out
-
-      Write-Host "##vso[task.setvariable variable=DeploymentSettingsFile]$out"
-      Write-Host "Gerado: $out"
 
 
 
