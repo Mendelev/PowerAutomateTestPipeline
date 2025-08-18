@@ -75,21 +75,19 @@ steps:
       Write-Host "Gerado: $out"
 
 # 5) Preencher EVs e vincular Connection References a conexões existentes
-# 5) Preencher EVs e vincular Connection References a conexões existentes
-# 5) Preencher EVs e vincular Connection References a conexões existentes
+# 5) Preencher EVs e vincular Connection References via CR_<LogicalName>
 - task: PowerShell@2
-  displayName: 'Preencher EVs e vincular Connection References (existentes)'
+  displayName: 'Preencher EVs e vincular Connection References (por variável)'
   inputs:
     targetType: 'inline'
     script: |
       $ErrorActionPreference = 'Stop'
       $settingsPath = "$(DeploymentSettingsFile)"
-      $envUrl       = "$(TargetEnvironmentUrl)"
-
       if(!(Test-Path $settingsPath)){ throw "Settings file não encontrado: $settingsPath" }
+
       $json = Get-Content $settingsPath -Raw | ConvertFrom-Json
 
-      # --- EVs: EV_<SchemaName>
+      # --- EVs: EV_<SchemaName> vindas das variáveis de ambiente do job
       foreach($ev in ($json.EnvironmentVariables | Where-Object { $_ })) {
         $schema = $ev.SchemaName
         $vName  = "EV_{0}" -f $schema
@@ -99,98 +97,54 @@ steps:
         Write-Host "EV [$schema] = (definida)"
       }
 
-      # --- Overrides manuais: CR_<LogicalName> (opcional)
-      foreach($cr in ($json.ConnectionReferences | Where-Object { $_ })) {
-        $logical = $cr.LogicalName
-        $preConn = [Environment]::GetEnvironmentVariable(("CR_{0}" -f $logical), 'Process')
-        if($preConn){
-          $cr.ConnectionId = $preConn
-          Write-Host "CR [$logical] = $preConn (definido por variável CR_)"
-        }
-      }
-
-      # --- Descobrir conexões existentes com PAC (sem JSON)
-      # 1ª tentativa: com --environment (compatível com 1.44.2)
-      $out = & pac connection list --environment $envUrl 2>&1
-      $txt = $out | Out-String
-      if ($LASTEXITCODE -ne 0) {
-        Write-Host "pac connection list --environment falhou, tentando sem parâmetro (usa org ativa)..."
-        $out = & pac connection list 2>&1
-        $txt = $out | Out-String
-        if ($LASTEXITCODE -ne 0) {
-          Write-Host $txt
-          throw "Falha ao executar 'pac connection list'."
-        }
-      }
-
-      # Parser 1: resource-id completo (/providers/.../apis/<api>/connections/<name>)
-      $connObjs = New-Object System.Collections.ArrayList
-      $ridPattern = '/providers/Microsoft\.PowerApps/apis/(?<api>[^/\s]+)/connections/(?<name>[^/\s]+)'
-      foreach($m in [regex]::Matches($txt, $ridPattern)){
-        [void]$connObjs.Add([pscustomobject]@{
-          apiName      = $m.Groups['api'].Value
-          name         = $m.Groups['name'].Value
-          connectionId = $m.Value
-        })
-      }
-
-      # Parser 2 (fallback): linha com <name> <apiName> ... (ex.: shared-msn...  shared_msnweather  Connected)
-      if($connObjs.Count -eq 0){
-        foreach($line in ($txt -split "`r?`n")){
-          if($line -match '^(?<name>\S+)\s+(?<api>shared_[a-z0-9_]+)\b'){
-            $name = $Matches['name']
-            $api  = $Matches['api']
-            $rid  = "/providers/Microsoft.PowerApps/apis/$api/connections/$name"
-            [void]$connObjs.Add([pscustomobject]@{
-              apiName      = $api
-              name         = $name
-              connectionId = $rid
-            })
-          }
-        }
-      }
-
-      if($connObjs.Count -eq 0){
-        Write-Host "Saída do PAC:"
-        Write-Host $txt
-        throw "Não foi possível interpretar a saída do 'pac connection list'."
-      }
-
-      # Vincular CRs pelo apiName
+      # --- Connection References: usar CR_<LogicalName>
       $missing = @()
-      foreach($cr in ($json.ConnectionReferences | Where-Object { $_ -and -not $_.ConnectionId })) {
-        $apiName = $null
-        if($cr.PSObject.Properties.Name -contains 'ConnectorId' -and $cr.ConnectorId){
-          $apiName = ($cr.ConnectorId -split '/apis/')[-1].Trim('/')
-        } elseif($cr.PSObject.Properties.Name -contains 'ApiName' -and $cr.ApiName){
-          $apiName = $cr.ApiName
-        }
+      foreach($cr in ($json.ConnectionReferences | Where-Object { $_ })) {
+        if ($cr.ConnectionId) { continue }
 
-        if([string]::IsNullOrWhiteSpace($apiName)){
-          Write-Warning "Não consegui inferir apiName para [$($cr.LogicalName)]"
-          $missing += [PSCustomObject]@{ LogicalName = $cr.LogicalName; ApiName = "(desconhecido)" }
+        $logical = $cr.LogicalName
+        $varName = "CR_{0}" -f $logical
+        $raw     = [Environment]::GetEnvironmentVariable($varName, 'Process')
+
+        if([string]::IsNullOrWhiteSpace($raw)) {
+          # coletar info pra mensagem de ajuda
+          $apiName = if ($cr.PSObject.Properties.Name -contains 'ConnectorId' -and $cr.ConnectorId) {
+            ($cr.ConnectorId -split '/apis/')[-1].Trim('/')
+          } elseif ($cr.PSObject.Properties.Name -contains 'ApiName') { $cr.ApiName } else { "(desconhecido)" }
+          $missing += [PSCustomObject]@{ LogicalName = $logical; ApiName = $apiName; VarName = $varName }
           continue
         }
 
-        $match = $connObjs | Where-Object { $_.apiName -eq $apiName } | Select-Object -First 1
-        if($match){
-          $cr.ConnectionId = $match.connectionId
-          Write-Host "CR [$($cr.LogicalName)] -> $apiName = $($cr.ConnectionId)"
+        # aceitar GUID puro ou resource-id (/providers/.../connections/<id>)
+        $cid = $raw
+        if ($raw -match '/connections/(?<id>[^/\s]+)') { $cid = $Matches['id'] }
+
+        if ([string]::IsNullOrWhiteSpace($cid)) {
+          Write-Warning "Valor inválido em $varName"
+          $missing += [PSCustomObject]@{ LogicalName = $logical; ApiName = $apiName; VarName = $varName }
         } else {
-          $missing += [PSCustomObject]@{ LogicalName = $cr.LogicalName; ApiName = $apiName }
+          $cr.ConnectionId = $cid
+          Write-Host "CR [$logical] = $cid (via $varName)"
         }
       }
 
-      # Salvar settings
+      # Salvar o settings atualizado
       $json | ConvertTo-Json -Depth 20 | Out-File -FilePath $settingsPath -Encoding utf8
       Write-Host "Settings atualizado: $settingsPath"
 
       if($missing.Count -gt 0){
-        $list = ($missing | ForEach-Object { "$($_.ApiName) [$($_.LogicalName)]" }) -join '; '
-        throw "Não encontrei conexões para: $list. Crie-as no ambiente OU informe via 'CR_<LogicalName>'."
+        Write-Host "`nFaltam ConnectionIds para os CRs abaixo:"
+        $missing | Format-Table
+        Write-Host "`nDefina no Variable Group (exemplos):"
+        foreach($m in $missing){
+          $example = "/providers/Microsoft.PowerApps/apis/$($m.ApiName)/connections/<id-da-sua-conexao>"
+          Write-Host "  $($m.VarName) = <GUID ou '$example'>"
+        }
+        throw "Defina as variáveis acima e reexecute o pipeline."
       } else {
-        Write-Host "Todas as Connection References foram vinculadas a conexões existentes."
+        Write-Host "Todas as Connection References foram vinculadas via CR_<LogicalName>."
       }
+
 
 
 
