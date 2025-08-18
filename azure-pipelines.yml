@@ -2,31 +2,20 @@ trigger:
 - main
 
 pool:
-  vmImage: windows-latest
+  vmImage: 'windows-latest'
 
-# 👇 Ajuste estes valores/variáveis (recomendo usar Variable Group e marcar segredos)
+# Unifique tudo no formato de lista e traga o secret do Variable Group
 variables:
-- group: TestSecretPowerAutomate   # <-- traz PP_ClientSecret como segredo
+- group: TestSecretPowerAutomate          # PP_ClientSecret (secret) aqui
 - name: PowerPlatformSPN
-  value: Teste-Pipeline-PowerAutomate
+  value: 'Teste-Pipeline-PowerAutomate'
 - name: TargetEnvironmentUrl
-  value: https://orgb94915f5.crm2.dynamics.com
-
-# SPN usado só para discovery (não secreto):
+  value: 'https://orgb94915f5.crm2.dynamics.com'
 - name: PP_TenantId
-  value: a91374ed-f750-4034-857f-03d6783934d8
+  value: 'a91374ed-f750-4034-857f-03d6783934d8'
 - name: PP_AppId
-  value: 4d8f1723-b528-4318-bd65-55bd38a7c554
-# NÃO declare PP_ClientSecret no YAML
-
-# Preferências (opcional):
-- name: PreferOwnerUpn
-  value: ''
-- name: NoAuthApiNames
-  value: shared_msnweather
-- name: ProvisionerUrl
-  value: ''
-
+  value: '4d8f1723-b528-4318-bd65-55bd38a7c554'
+# (Opcional) você pode definir EVs no nível do pipeline como variables "EV_<SchemaName>"
 
 steps:
 # 1) PAC no PATH
@@ -36,15 +25,33 @@ steps:
     DefaultVersion: true
     AddToolsToPath: true
 
+# 2) Autenticar PAC com o SPN (sem cmdlets Admin)
+- task: PowerShell@2
+  displayName: 'PAC Auth (Service Principal)'
+  env:
+    PP_ClientSecret: $(PP_ClientSecret)   # vem do Variable Group (secret)
+  inputs:
+    targetType: 'inline'
+    script: |
+      $ErrorActionPreference = 'Stop'
+      $url    = "$(TargetEnvironmentUrl)"
+      $appid  = "$(PP_AppId)"
+      $tenant = "$(PP_TenantId)"
+      $secret = $env:PP_ClientSecret
+      if (-not $secret) { throw "PP_ClientSecret não definido (Variable Group?)" }
+      pac --version
+      pac auth create --name "ci-spn" --url $url --applicationId $appid --clientSecret $secret --tenant $tenant
+      pac auth select --name "ci-spn"
+      pac auth who
 
-# 2) Pega o ZIP mais recente
+# 3) Pegar o ZIP mais recente do repo
 - task: PowerShell@2
   displayName: 'Selecionar ZIP da solução'
   inputs:
     targetType: 'inline'
     script: |
-      $root = "$(Build.SourcesDirectory)"
-      $zips = Get-ChildItem -Path $root -Recurse -Filter *.zip | Sort-Object LastWriteTime -Descending
+      $root  = "$(Build.SourcesDirectory)"
+      $zips  = Get-ChildItem -Path $root -Recurse -Filter *.zip | Sort-Object LastWriteTime -Descending
       if(-not $zips){ throw "Nenhum .zip encontrado em $root" }
       $picked = $zips[0].FullName
       New-Item -ItemType Directory -Force -Path "$(Build.ArtifactStagingDirectory)" | Out-Null
@@ -53,141 +60,107 @@ steps:
       Write-Host "##vso[task.setvariable variable=SolutionZip]$dest"
       Write-Host "Selecionado: $picked -> $dest"
 
-# 3) Gera o deployment.settings.json (EVs + CRs descobertos do ZIP)
+# 4) Gerar deployment.settings.json
 - task: PowerShell@2
-  displayName: 'Gerar deployment.settings.json (PAC)'
+  displayName: 'Gerar deployment.settings.json'
   inputs:
     targetType: 'inline'
     script: |
       $ErrorActionPreference = 'Stop'
-      pac --version
       $zip = "$(SolutionZip)"
       $out = "$(Build.ArtifactStagingDirectory)/deployment.settings.json"
       pac solution create-settings --solution-zip $zip --settings-file $out
-      if(!(Test-Path $out)){ throw "Falha ao gerar settings file" }
+      if(!(Test-Path $out)){ throw "Falha ao gerar $out" }
       Write-Host "##vso[task.setvariable variable=DeploymentSettingsFile]$out"
       Write-Host "Gerado: $out"
 
-# 4) (Idempotente) Carrega módulos Admin/Maker
+# 5) Preencher EVs e vincular Connection References a conexões existentes
 - task: PowerShell@2
-  displayName: 'Carregar módulos Power Platform'
+  displayName: 'Preencher EVs e vincular Connection References (existentes)'
   inputs:
     targetType: 'inline'
     script: |
       $ErrorActionPreference = 'Stop'
-      try { Set-PSRepository -Name PSGallery -InstallationPolicy Trusted -ErrorAction Stop } catch {}
-      foreach ($m in 'Microsoft.PowerApps.Administration.PowerShell','Microsoft.PowerApps.PowerShell'){
-        if (Get-Module -ListAvailable -Name $m) { Import-Module $m -Force } else { Install-Module $m -Scope CurrentUser -Force -AllowClobber; Import-Module $m -Force }
-      }
-      Get-Module Microsoft.PowerApps.* | Format-Table Name,Version
-
-# 5) 🔎 AUTO-DISCOVERY de connections + preenchimento de EVs
-- task: PowerShell@2
-  displayName: 'Bind de connections via Flow (sem Admin cmdlets)'
-  inputs:
-    targetType: 'inline'
-    script: |
-      $ErrorActionPreference = 'Stop'
-
       $settingsPath = "$(DeploymentSettingsFile)"
-      if (!(Test-Path $settingsPath)) { throw "Settings file não encontrado: $settingsPath" }
+      $envUrl       = "$(TargetEnvironmentUrl)"
+
+      if(!(Test-Path $settingsPath)){ throw "Settings file não encontrado: $settingsPath" }
       $json = Get-Content $settingsPath -Raw | ConvertFrom-Json
 
-      $provUrl = $env:ProvisionerUrl
-      $envUrl  = $env:TargetEnvironmentUrl
-      $spObjId = $env:ServicePrincipalObjectId  # opcional, use se o Flow fizer compartilhamento
+      # --- EVs: EV_<SchemaName> vindas das variáveis de ambiente do job
+      foreach($ev in ($json.EnvironmentVariables | Where-Object { $_ })) {
+        $schema = $ev.SchemaName
+        $vName  = "EV_{0}" -f $schema
+        $val    = [Environment]::GetEnvironmentVariable($vName, 'Process')
+        if([string]::IsNullOrWhiteSpace($val)) { continue }
+        $ev.Value = $val
+        Write-Host "EV [$schema] = (definida)"
+      }
 
-      if ([string]::IsNullOrWhiteSpace($provUrl)) { throw "ProvisionerUrl (env) não definido." }
-      if (-not [Uri]::IsWellFormedUriString($provUrl, [UriKind]::Absolute)) { throw "ProvisionerUrl inválido: $provUrl" }
-      if ([string]::IsNullOrWhiteSpace($envUrl)) { throw "TargetEnvironmentUrl (env) não definido." }
-
-      # 1) EVs via EV_<SchemaName>
-      if ($json.EnvironmentVariables) {
-        foreach($ev in $json.EnvironmentVariables){
-          if(-not $ev){ continue }
-          $schema = $ev.SchemaName
-          $vName  = "EV_{0}" -f $schema
-          $val    = [Environment]::GetEnvironmentVariable($vName, 'Process')
-          if([string]::IsNullOrWhiteSpace($val)) { continue }
-          $ev.Value = $val
-          Write-Host "EV [$schema] = $val"
+      # --- Overrides manuais: CR_<LogicalName> (opcional)
+      foreach($cr in ($json.ConnectionReferences | Where-Object { $_ })) {
+        $logical = $cr.LogicalName
+        $preConn = [Environment]::GetEnvironmentVariable(("CR_{0}" -f $logical), 'Process')
+        if($preConn){
+          $cr.ConnectionId = $preConn
+          Write-Host "CR [$logical] = $preConn (definido por variável CR_)"
         }
       }
 
-      # 2) Lista de CRs sem ConnectionId (respeita overrides CR_<LogicalName>)
-      $needed = @()
-      foreach($cr in $json.ConnectionReferences){
-        if(-not $cr){ continue }
-        if($cr.ConnectionId){ continue }
+      # --- Descobrir conexões existentes com PAC (sem Admin)
+      # Use -e (alias de --environment). --json retorna JSON parsável.
+      $raw = pac connection list -e $envUrl --json
+      try { $conns = $raw | ConvertFrom-Json } catch { throw "Falha ao ler lista de conexões do PAC. Saída: `n$raw" }
+      if(-not $conns){ throw "Nenhuma conexão retornada pelo PAC. Verifique permissões do App User no ambiente." }
 
-        $override = [Environment]::GetEnvironmentVariable(("CR_{0}" -f $cr.LogicalName), 'Process')
-        if($override){
-          $cr.ConnectionId = $override
-          Write-Host "CR [$($cr.LogicalName)] override = $override"
-          continue
-        }
-
-        # Inferir apiName
+      $missing = @()
+      foreach($cr in ($json.ConnectionReferences | Where-Object { $_ -and -not $_.ConnectionId })) {
         $apiName = $null
-        if ($cr.PSObject.Properties.Name -contains 'ConnectorId' -and $cr.ConnectorId) { $apiName = ($cr.ConnectorId -split '/')[-1] }
-        elseif ($cr.PSObject.Properties.Name -contains 'ApiName' -and $cr.ApiName)     { $apiName = $cr.ApiName }
+        if($cr.PSObject.Properties.Name -contains 'ConnectorId' -and $cr.ConnectorId){
+          $apiName = ($cr.ConnectorId -split '/apis/')[-1].Trim('/')
+        } elseif($cr.PSObject.Properties.Name -contains 'ApiName' -and $cr.ApiName){
+          $apiName = $cr.ApiName
+        }
 
-        if ([string]::IsNullOrWhiteSpace($apiName)) {
-          Write-Warning "Não consegui inferir apiName p/ CR [$($cr.LogicalName)]"
+        if([string]::IsNullOrWhiteSpace($apiName)){
+          Write-Warning "Não consegui inferir apiName para [$($cr.LogicalName)]"; 
+          $missing += [PSCustomObject]@{ LogicalName = $cr.LogicalName; ApiName = "(desconhecido)" }
           continue
         }
 
-        $needed += [PSCustomObject]@{ logicalName = $cr.LogicalName; apiName = $apiName }
-      }
+        $match = $conns | Where-Object {
+          ($_.apiName -eq $apiName) -or
+          ($_.connectorId -match [regex]::Escape($apiName)) -or
+          ($_.name -match [regex]::Escape($apiName))
+        } | Select-Object -First 1
 
-      if ($needed.Count -gt 0) {
-        # 3) Chama o Flow provisionador
-        $payload = @{
-          targetEnvironmentUrl = $envUrl
-          principalObjectId    = $spObjId   # se seu Flow usar; senão, pode omitir
-          connectors           = $needed     # [{ logicalName, apiName }]
-        } | ConvertTo-Json -Depth 6
-
-        Write-Host "POST $provUrl"
-        $resp = Invoke-RestMethod -Method POST -Uri $provUrl -ContentType 'application/json' -Body $payload
-
-        # Esperado: { bindings:[{logicalName,apiName,connectionId}], missing:[{logicalName,apiName,reason}] }
-        $bindings = @()
-        if ($resp -and $resp.PSObject.Properties.Name -contains 'bindings' -and $resp.bindings) { $bindings = @($resp.bindings) }
-
-        foreach($b in $bindings){
-          $cr = $json.ConnectionReferences | Where-Object { $_.LogicalName -eq $b.logicalName } | Select-Object -First 1
-          if($cr){
-            $cr.ConnectionId = $b.connectionId
-            Write-Host "CR [$($b.logicalName)] <- $($b.connectionId)"
-          }
+        $cid = $null
+        if ($match) {
+          # propriedades comuns: connectionId ou name
+          if ($match.PSObject.Properties.Name -contains 'connectionId') { $cid = $match.connectionId }
+          if (-not $cid -and $match.PSObject.Properties.Name -contains 'name') { $cid = $match.name }
         }
 
-        $missing = @()
-        if ($resp -and $resp.PSObject.Properties.Name -contains 'missing' -and $resp.missing) { $missing = @($resp.missing) }
-
-        if ($missing.Count -gt 0){
-          Write-Host "Connections pendentes (Flow reportou 'missing'):"
-          $labels = @()
-          foreach($m in $missing){
-            $reason = $m.reason
-            if ([string]::IsNullOrWhiteSpace($reason)) { $reason = 'unknown' }
-            $labels += ("{0} [{1}] - {2}" -f $m.apiName, $m.logicalName, $reason)
-          }
-          $list = ($labels -join '; ')
-          throw "Ainda faltam connections: $list. Crie uma connection no ambiente OU passe CR_<LogicalName> como variável e rode de novo."
+        if($cid){
+          $cr.ConnectionId = $cid
+          Write-Host "CR [$($cr.LogicalName)] -> $apiName = $cid"
+        } else {
+          $missing += [PSCustomObject]@{ LogicalName = $cr.LogicalName; ApiName = $apiName }
         }
-      } else {
-        Write-Host "Nenhuma Connection Reference pendente."
       }
 
-      # 4) Salva settings
+      # Salva o settings atualizado
       $json | ConvertTo-Json -Depth 20 | Out-File -FilePath $settingsPath -Encoding utf8
       Write-Host "Settings atualizado: $settingsPath"
 
+      if($missing.Count -gt 0){
+        $list = ($missing | ForEach-Object { "$($_.ApiName) [$($_.LogicalName)]" }) -join '; '
+        throw "Não encontrei conexões para: $list. Crie-as no ambiente OU informe manualmente via 'CR_<LogicalName>' nas variáveis."
+      } else {
+        Write-Host "Todas as Connection References foram vinculadas a conexões existentes."
+      }
 
-
-# 6) Importa usando o settings
+# 6) Importar solução usando o settings preenchido
 - task: PowerPlatformImportSolution@2
   displayName: 'Import Solution (com settings)'
   inputs:
@@ -199,23 +172,3 @@ steps:
     AsyncOperation: true
     MaxAsyncWaitTime: '60'
     StageAndUpgrade: false
-
-# 7) (Opcional) Ativar fluxos — pode reaproveitar este bloco mais tarde
-# Basta preencher PP_TenantId, PP_AppId, PP_ClientSecret (já estão aí)
-- task: PowerShell@2
-  displayName: 'Ativar fluxos (opcional)'
-  inputs:
-    targetType: 'inline'
-    script: |
-      $ErrorActionPreference = 'Stop'
-      foreach ($m in 'Microsoft.PowerApps.Administration.PowerShell','Microsoft.PowerApps.PowerShell'){
-        if (Get-Module -ListAvailable -Name $m) { Import-Module $m -Force } else { Install-Module $m -Scope CurrentUser -Force -AllowClobber; Import-Module $m -Force }
-      }
-      Add-PowerAppsAccount -TenantID "$(PP_TenantId)" -ApplicationId "$(PP_AppId)" -ClientSecret "$(PP_ClientSecret)" | Out-Null
-      $env = Get-AdminPowerAppEnvironment | Where-Object { $_.Properties.linkedEnvironmentMetadata.instanceUrl -eq "$(TargetEnvironmentUrl)" } | Select-Object -First 1
-      if(-not $env){ throw "Env não encontrado: $(TargetEnvironmentUrl)" }
-      $flows = Get-AdminFlow -EnvironmentName $env.EnvironmentName
-      foreach($f in $flows){
-        try{ Enable-AdminFlow -EnvironmentName $env.EnvironmentName -FlowName $f.FlowName -ErrorAction Stop; Write-Host "Ligado: $($f.DisplayName)" }
-        catch{ Write-Warning "Não liguei $($f.DisplayName): $($_.Exception.Message)" }
-      }
