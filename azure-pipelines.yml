@@ -134,6 +134,14 @@ steps:
         Write-Host "Todas as Connection References foram vinculadas via CR_<LogicalName>."
       }
 
+- task: PowerShell@2
+  displayName: 'DEBUG: mostrar ConnectionReferences resolvidas'
+  inputs:
+    targetType: 'inline'
+    script: |
+      $settingsPath = "$(DeploymentSettingsFile)"
+      $json = Get-Content $settingsPath -Raw | ConvertFrom-Json
+      $json.ConnectionReferences | Select-Object LogicalName, ConnectorId, ConnectionId | Format-Table
 
 
 
