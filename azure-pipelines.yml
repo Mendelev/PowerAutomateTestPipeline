@@ -83,21 +83,17 @@ steps:
 
 # 5) 🔎 AUTO-DISCOVERY de connections + preenchimento de EVs
 - task: PowerShell@2
-  displayName: 'Auto-discovery de connections e preenchimento do settings (adaptativo)'
+  displayName: 'Auto-discovery de connections e preenchimento do settings (robusto)'
   inputs:
     targetType: 'inline'
     script: |
       $ErrorActionPreference = 'Stop'
-      $settingsPath = "$(DeploymentSettingsFile)"
-      $envUrl       = "$(TargetEnvironmentUrl)"
-      $preferUpn    = "$(PreferOwnerUpn)"
-      $provUrl      = "$(ProvisionerUrl)"
-      $noAuthList   = "$(NoAuthApiNames)".Split(';',[System.StringSplitOptions]::RemoveEmptyEntries) | ForEach-Object { $_.Trim() }
 
+      $settingsPath = "$(DeploymentSettingsFile)"
       if(!(Test-Path $settingsPath)){ throw "Settings file não encontrado: $settingsPath" }
       $json = Get-Content $settingsPath -Raw | ConvertFrom-Json
 
-      # --- 1) EVs via EV_<SchemaName> (sempre) ---
+      # ----- 1) Preencher EVs por variáveis EV_<SchemaName> -----
       foreach($ev in ($json.EnvironmentVariables | Where-Object { $_ })) {
         $schema = $ev.SchemaName
         $vName  = "EV_{0}" -f $schema
@@ -107,109 +103,133 @@ steps:
         Write-Host "EV [$schema] = $val"
       }
 
-      # Constrói lista de CRs requeridos
-      $required = @()
+      # ----- 2) Login com SPN para discovery (Admin cmdlets) -----
+      $tenant = "$(PP_TenantId)"; $app = "$(PP_AppId)"; $secret = "$(PP_ClientSecret)"
+      if([string]::IsNullOrWhiteSpace($tenant) -or [string]::IsNullOrWhiteSpace($app) -or [string]::IsNullOrWhiteSpace($secret)){
+        throw "PP_* não definidos. Para o modo discovery, defina PP_TenantId, PP_AppId e PP_ClientSecret (secure)."
+      }
+
+      try { Set-PSRepository -Name PSGallery -InstallationPolicy Trusted -ErrorAction Stop } catch {}
+      foreach ($m in 'Microsoft.PowerApps.Administration.PowerShell','Microsoft.PowerApps.PowerShell'){
+        if (Get-Module -ListAvailable -Name $m) { Import-Module $m -Force } else { Install-Module $m -Scope CurrentUser -Force -AllowClobber; Import-Module $m -Force }
+      }
+      Add-PowerAppsAccount -TenantID $tenant -ApplicationId $app -ClientSecret $secret | Out-Null
+
+      # ----- 3) Resolver o ambiente (robusto) -----
+      $targetUrl = "$(TargetEnvironmentUrl)".TrimEnd('/')
+      $targetName = "$(TargetEnvironmentName)"  # opcional: ex. 'Default-12345678-...'
+      $envs = Get-AdminPowerAppEnvironment
+
+      if(-not $envs){ throw "Nenhum ambiente retornado. Verifique permissões do app (Power Platform Administrator) OU adicione-o como Application user ao ambiente." }
+
+      Write-Host "Ambientes visíveis pelo SPN:"
+      $envs | Select-Object EnvironmentName,DisplayName,Location | Format-Table
+
+      $env = $null
+      if(-not [string]::IsNullOrWhiteSpace($targetName)){
+        $env = $envs | Where-Object { $_.EnvironmentName -eq $targetName } | Select-Object -First 1
+        if($env){ Write-Host "Encontrado por TargetEnvironmentName: $($env.EnvironmentName) / $($env.DisplayName)" }
+      }
+
+      if(-not $env){
+        # Normaliza host; tenta achar em qualquer campo do linkedEnvironmentMetadata
+        $host = ([Uri]$targetUrl).Host
+        foreach($e in $envs){
+          $lem = $e.Properties.linkedEnvironmentMetadata
+          if(-not $lem){ continue }
+          # Converte propriedades em texto e tenta 'contains' do host
+          $lemJson = ($lem | ConvertTo-Json -Depth 10)
+          if($lemJson -match [Regex]::Escape($host)){
+            $env = $e; break
+          }
+        }
+      }
+
+      if(-not $env){
+        # Último fallback: tente campos "comuns"
+        foreach($e in $envs){
+          $p = $e.Properties
+          $candidatos = @()
+          if($p -and $p.linkedEnvironmentMetadata){
+            $lem = $p.linkedEnvironmentMetadata
+            $candidatos += @(
+              $lem.instanceUrl,
+              $lem.baseApiUrl,
+              $lem.organizationUrl,
+              $lem.instancesApiUrl,
+              $lem.dataverseUrl
+            )
+          }
+          if($candidatos | Where-Object { $_ -and $_.ToString().TrimEnd('/') -eq $targetUrl }){
+            $env = $e; break
+          }
+        }
+      }
+
+      if(-not $env){
+        # Ajuda de diagnóstico
+        Write-Warning "Não achei ambiente pelo URL: $targetUrl"
+        Write-Host "Dica: informe TargetEnvironmentName para evitar ambiguidade (ex.: 'Default-xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx')."
+        throw "Environment não encontrado. Revise: TargetEnvironmentUrl, tenant (PP_TenantId) e permissões do app."
+      }
+
+      $envName = $env.EnvironmentName
+      Write-Host "Environment resolvido: $envName / $($env.DisplayName)"
+
+      # ----- 4) Fazer o bind das Connection References -----
+      # Preferência opcional: priorizar connections de um UPN específico
+      $preferUpn = "$(PreferOwnerUpn)"
+
       foreach($cr in ($json.ConnectionReferences | Where-Object { $_ })) {
-        $logical = $cr.LogicalName
+        if($cr.ConnectionId){ Write-Host "CR [$($cr.LogicalName)] já tem ConnectionId."; continue }
+
+        # Override por variável CR_<LogicalName>, se houver
+        $override = [Environment]::GetEnvironmentVariable(("CR_{0}" -f $cr.LogicalName), 'Process')
+        if($override){
+          $cr.ConnectionId = $override
+          Write-Host "CR [$($cr.LogicalName)] = $override (pré-definido)"
+          continue
+        }
+
+        # Descobrir apiName
         $apiName = $null
         if($cr.PSObject.Properties.Name -contains 'ConnectorId' -and $cr.ConnectorId) { $apiName = ($cr.ConnectorId -split '/')[-1] }
         elseif ($cr.PSObject.Properties.Name -contains 'ApiName' -and $cr.ApiName)     { $apiName = $cr.ApiName }
-        if([string]::IsNullOrWhiteSpace($apiName)) { Write-Warning "Não consegui inferir apiName p/ CR [$logical]"; continue }
-        $required += [PSCustomObject]@{ LogicalName = $logical; ApiName = $apiName }
-      }
 
-      # Já aplicar overrides CR_<LogicalName>, se existirem
-      foreach($cr in ($json.ConnectionReferences | Where-Object { $_ })) {
-        $logical = $cr.LogicalName
-        $preConn = [Environment]::GetEnvironmentVariable(("CR_{0}" -f $logical), 'Process')
-        if($preConn) {
-          $cr.ConnectionId = $preConn
-          Write-Host "CR [$logical] = $preConn (pré-definido por variável)"
+        if([string]::IsNullOrWhiteSpace($apiName)){
+          Write-Warning "Não consegui inferir apiName para CR [$($cr.LogicalName)]. Pulei."
+          continue
+        }
+
+        $conns = Get-AdminPowerAppConnection -EnvironmentName $envName -ConnectorName $apiName -ErrorAction SilentlyContinue
+        if(-not $conns){
+          Write-Warning "Nenhuma connection encontrada para $apiName no ambiente $envName."
+          continue
+        }
+
+        $chosen = $null
+        if($preferUpn){
+          $chosen = $conns | Where-Object { $_.Status -eq 'Connected' -and $_.CreatedBy.userPrincipalName -eq $preferUpn } | Select-Object -First 1
+        }
+        if(-not $chosen){ $chosen = $conns | Where-Object { $_.Status -eq 'Connected' } | Select-Object -First 1 }
+        if(-not $chosen){ $chosen = $conns | Select-Object -First 1 }
+
+        if($chosen){
+          $cr.ConnectionId = $chosen.Name  # GUID da connection
+          Write-Host "CR [$($cr.LogicalName)] -> $apiName = $($cr.ConnectionId) ($($chosen.Status))"
+        } else {
+          Write-Warning "Connections existem para $apiName, mas nenhuma selecionada."
         }
       }
 
-      # --- 2) Caminho A: discovery via cmdlets Admin (se PP_* estiverem definidos) ---
-      $tenant = "$(PP_TenantId)"; $app = "$(PP_AppId)"; $secret = "$(PP_ClientSecret)"
-      $didDiscovery = $false
-      if(-not [string]::IsNullOrWhiteSpace($tenant) -and -not [string]::IsNullOrWhiteSpace($app) -and -not [string]::IsNullOrWhiteSpace($secret)) {
-        # Carrega módulos (idempotente)
-        try { Set-PSRepository -Name PSGallery -InstallationPolicy Trusted -ErrorAction Stop } catch {}
-        foreach ($m in 'Microsoft.PowerApps.Administration.PowerShell','Microsoft.PowerApps.PowerShell'){
-          if (Get-Module -ListAvailable -Name $m) { Import-Module $m -Force } else { Install-Module $m -Scope CurrentUser -Force -AllowClobber; Import-Module $m -Force }
-        }
-        Add-PowerAppsAccount -TenantID $tenant -ApplicationId $app -ClientSecret $secret | Out-Null
-
-        $env = Get-AdminPowerAppEnvironment | Where-Object {
-          $_.Properties.linkedEnvironmentMetadata.instanceUrl -eq $envUrl -or
-          $_.Properties.linkedEnvironmentMetadata.instanceUrl -like "$envUrl*"
-        } | Select-Object -First 1
-        if(-not $env) { throw "Environment não encontrado por URL: $envUrl" }
-        $envName = $env.EnvironmentName
-        Write-Host "Discovery: usando Admin cmdlets no ambiente $envName"
-
-        foreach($cr in ($json.ConnectionReferences | Where-Object { $_ -and -not $_.ConnectionId })) {
-          $logical = $cr.LogicalName
-          $apiName = ($cr.ConnectorId -split '/')[-1]
-          $conns = Get-AdminPowerAppConnection -EnvironmentName $envName -ConnectorName $apiName -ErrorAction SilentlyContinue
-          if($conns) {
-            $chosen = $null
-            if($preferUpn) { $chosen = $conns | Where-Object { $_.Status -eq 'Connected' -and $_.CreatedBy.userPrincipalName -eq $preferUpn } | Select-Object -First 1 }
-            if(-not $chosen) { $chosen = $conns | Where-Object { $_.Status -eq 'Connected' } | Select-Object -First 1 }
-            if(-not $chosen) { $chosen = $conns | Select-Object -First 1 }
-            if($chosen) {
-              $cr.ConnectionId = $chosen.Name
-              Write-Host "CR [$logical] -> $apiName = $($cr.ConnectionId)"
-            }
-          }
-        }
-        $didDiscovery = $true
-      } else {
-        Write-Host "Discovery: PP_* não definidos; pulando cmdlets Admin."
-      }
-
-      # --- 3) Caminho B: Flow provisionador (sem secret) para conectores 'no-auth' ---
-      $canProvision = ([string]::IsNullOrWhiteSpace($provUrl) -eq $false) -and [Uri]::IsWellFormedUriString($provUrl,[UriKind]::Absolute)
-      if($canProvision) { Write-Host "ProvisionerUrl ativo (no-auth apenas)." }
-      $missing = @()
-
-      foreach($cr in ($json.ConnectionReferences | Where-Object { $_ -and -not $_.ConnectionId })) {
-        $logical = $cr.LogicalName
-        $apiName = ($cr.ConnectorId -split '/')[-1]
-        if($canProvision -and ($noAuthList -contains $apiName)) {
-          $body = @{
-            targetEnvironmentUrl = $envUrl
-            apiName              = $apiName
-            connectionParams     = @{}                 # sem auth
-            principalObjectId    = "$(ServicePrincipalObjectId)"
-          } | ConvertTo-Json -Depth 5
-          Write-Host "Provisionando conexão no-auth para [$logical] ($apiName)..."
-          try{
-            $resp = Invoke-RestMethod -Method POST -Uri $provUrl -Body $body -ContentType 'application/json'
-            if($resp.connectionId) {
-              $cr.ConnectionId = $resp.connectionId
-              Write-Host "CR [$logical] -> criada: $($resp.connectionId)"
-              continue
-            } else {
-              Write-Warning "Flow provisionador não retornou connectionId p/ $apiName."
-            }
-          } catch {
-            Write-Warning "Falha ao provisionar $apiName para [$logical]: $($_.Exception.Message)"
-          }
-        }
-        if(-not $cr.ConnectionId) {
-          $missing += [PSCustomObject]@{ LogicalName = $logical; ApiName = $apiName; Motivo = "Sem connection disponível" }
-        }
-      }
-
-      # Salva settings
+      # ----- 5) Salvar settings e validar pendências -----
       $json | ConvertTo-Json -Depth 20 | Out-File -FilePath $settingsPath -Encoding utf8
       Write-Host "Settings atualizado: $settingsPath"
 
-      if($missing.Count -gt 0) {
-        Write-Host "Connections pendentes:"
-        $missing | Format-Table
-        $list = ($missing | ForEach-Object { "$($_.ApiName) [$($_.LogicalName)]" }) -join '; '
-        throw "Crie 1 connection por conector OU defina CR_<LogicalName> nas variáveis OU habilite ProvisionerUrl/NoAuthApiNames: $list"
+      $missing = @($json.ConnectionReferences | Where-Object { -not $_.ConnectionId })
+      if($missing.Count -gt 0){
+        $list = ($missing | ForEach-Object { "$($_.ApiName ?? ($_.ConnectorId -split '/')[-1]) [$($_.LogicalName)]" }) -join '; '
+        throw "Ainda faltam connections para: $list. Crie 1 por conector OU defina CR_<LogicalName> nas variáveis e rode novamente."
       } else {
         Write-Host "Todas as Connection References foram resolvidas."
       }
