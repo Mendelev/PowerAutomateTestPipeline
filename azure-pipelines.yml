@@ -10,18 +10,40 @@ variables:
   CROverrides: ''  
 
 steps:
+- task: PowerPlatformToolInstaller@2
+  displayName: 'Power Platform Tool Installer'
+  inputs:
+    DefaultVersion: true
+    AddToolsToPath: true
+
 # 1) Instala o PAC CLI (para gerar o settings) e módulos PowerShell
 - task: PowerShell@2
-  displayName: 'Instalar PAC CLI + módulos PowerShell'
+  displayName: 'Carregar módulos Power Platform (idempotente)'
   inputs:
-    targetType: 'inline'
+    targetType: inline
     script: |
-      iwr https://aka.ms/powerplatform-vscode -UseBasicParsing -OutFile pac.msi
-      Start-Process msiexec.exe -ArgumentList '/i pac.msi /qn' -Wait
-      # Módulos PowerShell (Admin + Makers)
-      Install-Module Microsoft.PowerApps.Administration.PowerShell -Force -Scope CurrentUser
-      Install-Module Microsoft.PowerApps.PowerShell -Force -Scope CurrentUser
+      $ErrorActionPreference = 'Stop'
+      # Evita prompt de repositório não confiável (alguns agentes mostram)
+      try { Set-PSRepository -Name PSGallery -InstallationPolicy Trusted -ErrorAction Stop } catch {}
 
+      $mods = @(
+        'Microsoft.PowerApps.Administration.PowerShell', # Admin cmdlets (Get-Admin*, Enable-AdminFlow, etc.)
+        'Microsoft.PowerApps.PowerShell'                 # Maker cmdlets (Add-PowerAppsAccount, etc.)
+      )
+
+      foreach ($m in $mods) {
+        if (Get-Module -ListAvailable -Name $m) {
+          Write-Host "Módulo $m já disponível. Importando..."
+          Import-Module $m -Force -ErrorAction Stop
+        } else {
+          Write-Host "Instalando $m (CurrentUser, AllowClobber)..."
+          Install-Module $m -Scope CurrentUser -Force -AllowClobber
+          Import-Module $m -Force -ErrorAction Stop
+        }
+      }
+
+      # Sanidade: mostre versões carregadas
+      Get-Module Microsoft.PowerApps.* | Format-Table Name, Version
 # 2) Escolhe o ZIP mais recente do repositório e salva como solution.zip
 - task: PowerShell@2
   displayName: 'Selecionar o .zip da solução'
@@ -41,12 +63,13 @@ steps:
 - task: PowerShell@2
   displayName: 'Gerar deployment.settings.json (PAC CLI)'
   inputs:
-    targetType: 'inline'
+    targetType: inline
     script: |
+      $ErrorActionPreference = 'Stop'
+      pac --version
       $zip = "$(SolutionZip)"
-      $out = "$(Build.ArtifactStagingDirectory)\deployment.settings.json"
-      & "$env:LOCALAPPDATA\Microsoft\PowerAppsCLI\pac.exe" solution create-settings --solution-zip $zip --settings-file $out
-      if(!(Test-Path $out)){ throw "Falha ao gerar settings file" }
+      $out = "$(Build.ArtifactStagingDirectory)/deployment.settings.json"
+      pac solution create-settings --solution-zip $zip --settings-file $out
       Write-Host "##vso[task.setvariable variable=DeploymentSettingsFile]$out"
       Write-Host "Gerado: $out"
 
