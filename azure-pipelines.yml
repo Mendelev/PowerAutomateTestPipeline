@@ -76,6 +76,7 @@ steps:
 
 # 5) Preencher EVs e vincular Connection References a conexões existentes
 # 5) Preencher EVs e vincular Connection References a conexões existentes
+# 5) Preencher EVs e vincular Connection References a conexões existentes
 - task: PowerShell@2
   displayName: 'Preencher EVs e vincular Connection References (existentes)'
   inputs:
@@ -88,7 +89,7 @@ steps:
       if(!(Test-Path $settingsPath)){ throw "Settings file não encontrado: $settingsPath" }
       $json = Get-Content $settingsPath -Raw | ConvertFrom-Json
 
-      # --- EVs: EV_<SchemaName> vindas das variáveis de ambiente do job
+      # --- EVs: EV_<SchemaName>
       foreach($ev in ($json.EnvironmentVariables | Where-Object { $_ })) {
         $schema = $ev.SchemaName
         $vName  = "EV_{0}" -f $schema
@@ -108,18 +109,21 @@ steps:
         }
       }
 
-      # --- Descobrir conexões existentes com PAC (sem --json)
-      # Observação: 'pac connection list' não suporta saída JSON em algumas versões.
-      # Vamos capturar a saída em texto e extrair os resource-ids /apis/<apiName>/connections/<name>.
-      $out = & pac connection list -e $envUrl 2>&1
+      # --- Descobrir conexões existentes com PAC (sem JSON)
+      # 1ª tentativa: com --environment (compatível com 1.44.2)
+      $out = & pac connection list --environment $envUrl 2>&1
       $txt = $out | Out-String
       if ($LASTEXITCODE -ne 0) {
-        Write-Host $txt
-        throw "Falha ao executar 'pac connection list'."
+        Write-Host "pac connection list --environment falhou, tentando sem parâmetro (usa org ativa)..."
+        $out = & pac connection list 2>&1
+        $txt = $out | Out-String
+        if ($LASTEXITCODE -ne 0) {
+          Write-Host $txt
+          throw "Falha ao executar 'pac connection list'."
+        }
       }
 
-      # Parser 1: pega resource-ids completos, p.ex.:
-      # /providers/Microsoft.PowerApps/apis/shared_msnweather/connections/shared-msnweather-123
+      # Parser 1: resource-id completo (/providers/.../apis/<api>/connections/<name>)
       $connObjs = New-Object System.Collections.ArrayList
       $ridPattern = '/providers/Microsoft\.PowerApps/apis/(?<api>[^/\s]+)/connections/(?<name>[^/\s]+)'
       foreach($m in [regex]::Matches($txt, $ridPattern)){
@@ -130,11 +134,9 @@ steps:
         })
       }
 
-      # Parser 2 (fallback): tabela em texto com "name" e "apiName" na mesma linha
-      # Se não conseguiu nenhum RID, tenta construir o RID a partir de nome + api.
+      # Parser 2 (fallback): linha com <name> <apiName> ... (ex.: shared-msn...  shared_msnweather  Connected)
       if($connObjs.Count -eq 0){
         foreach($line in ($txt -split "`r?`n")){
-          # Ex.: "shared-msnweather-123   shared_msnweather   Connected"
           if($line -match '^(?<name>\S+)\s+(?<api>shared_[a-z0-9_]+)\b'){
             $name = $Matches['name']
             $api  = $Matches['api']
@@ -154,7 +156,7 @@ steps:
         throw "Não foi possível interpretar a saída do 'pac connection list'."
       }
 
-      # Vincular cada Connection Reference pelo apiName
+      # Vincular CRs pelo apiName
       $missing = @()
       foreach($cr in ($json.ConnectionReferences | Where-Object { $_ -and -not $_.ConnectionId })) {
         $apiName = $null
@@ -170,7 +172,6 @@ steps:
           continue
         }
 
-        # pega a primeira conexão do mesmo apiName (se quiser, refine a seleção)
         $match = $connObjs | Where-Object { $_.apiName -eq $apiName } | Select-Object -First 1
         if($match){
           $cr.ConnectionId = $match.connectionId
@@ -180,16 +181,17 @@ steps:
         }
       }
 
-      # Salva o settings atualizado
+      # Salvar settings
       $json | ConvertTo-Json -Depth 20 | Out-File -FilePath $settingsPath -Encoding utf8
       Write-Host "Settings atualizado: $settingsPath"
 
       if($missing.Count -gt 0){
         $list = ($missing | ForEach-Object { "$($_.ApiName) [$($_.LogicalName)]" }) -join '; '
-        throw "Não encontrei conexões para: $list. Crie-as no ambiente OU informe manualmente via 'CR_<LogicalName>' nas variáveis."
+        throw "Não encontrei conexões para: $list. Crie-as no ambiente OU informe via 'CR_<LogicalName>'."
       } else {
         Write-Host "Todas as Connection References foram vinculadas a conexões existentes."
       }
+
 
 
 
