@@ -75,6 +75,7 @@ steps:
       Write-Host "Gerado: $out"
 
 # 5) Preencher EVs e vincular Connection References a conexões existentes
+# 5) Preencher EVs e vincular Connection References a conexões existentes
 - task: PowerShell@2
   displayName: 'Preencher EVs e vincular Connection References (existentes)'
   inputs:
@@ -189,6 +190,7 @@ steps:
       } else {
         Write-Host "Todas as Connection References foram vinculadas a conexões existentes."
       }
+
 
 
 # 6) Importar solução usando o settings preenchido
