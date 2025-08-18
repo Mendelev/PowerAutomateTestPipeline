@@ -77,9 +77,10 @@ steps:
 # 5) Preencher EVs e vincular Connection References a conexões existentes
 - task: PowerShell@2
   displayName: 'Preencher EVs e vincular Connection References (por variável)'
+  # injete aqui as variáveis do Variable Group que o step precisa enxergar
   env:
-    CR_smarthis_sharedmsnweather_b8b93: $(CR_smarthis_sharedmsnweather_b8b93)   # <- injeta a var do VG
-    CRAPI_shared_msnweather: $(CRAPI_shared_msnweather)                          # (opcional) 1 por conector
+    CR_smarthis_sharedmsnweather_b8b93: $(CR_smarthis_sharedmsnweather_b8b93)   # obrigatório para seu caso
+    CRAPI_shared_msnweather: $(CRAPI_shared_msnweather)                          # opcional (fallback por API)
   inputs:
     targetType: 'inline'
     script: |
@@ -89,7 +90,7 @@ steps:
 
       $json = Get-Content $settingsPath -Raw | ConvertFrom-Json
 
-      # helper para ler env var de modo case-insensitive
+      # helper para ler env var de modo case-insensitive (PS 5.1 friendly)
       function Get-EnvCI([string]$name){
         $v = [Environment]::GetEnvironmentVariable($name, 'Process')
         if ([string]::IsNullOrEmpty($v)) {
@@ -99,61 +100,76 @@ steps:
         return $v
       }
 
-      # EVs: EV_<SchemaName>
+      # --- EVs: EV_<SchemaName>
       foreach($ev in ($json.EnvironmentVariables | Where-Object { $_ })) {
         $schema = $ev.SchemaName
-        $vName  = "EV_{0}" -f $schema
+        $vName  = ("EV_{0}" -f $schema)
         $val    = Get-EnvCI $vName
-        if([string]::IsNullOrWhiteSpace($val)) { continue }
-        $ev.Value = $val
-        Write-Host "EV [$schema] = (definida)"
+        if(-not [string]::IsNullOrWhiteSpace($val)) {
+          $ev.Value = $val
+          Write-Host "EV [$schema] = (definida)"
+        }
       }
 
-      # CR via nome lógico: CR_<LogicalName>
+      # --- Connection References via variáveis
       $missing = @()
       foreach($cr in ($json.ConnectionReferences | Where-Object { $_ })) {
         if ($cr.ConnectionId) { continue }
 
         $logical = $cr.LogicalName
-        $varName = "CR_{0}" -f $logical
+        $varName = ("CR_{0}" -f $logical)
         $raw     = Get-EnvCI $varName
 
-        # Fallback por ApiName: CRAPI_<ApiName>
+        # tentar fallback por ApiName: CRAPI_<ApiName>
         if([string]::IsNullOrWhiteSpace($raw)){
           $apiName = $null
           if($cr.PSObject.Properties.Name -contains 'ConnectorId' -and $cr.ConnectorId){
-            $apiName = ($cr.ConnectorId -split '/apis/')[-1].Trim('/')
-          } elseif ($cr.PSObject.Properties.Name -contains 'ApiName'){ $apiName = $cr.ApiName }
-          if($apiName){
-            $apiVar = "CRAPI_{0}" -f $apiName
+            $apiName = (($cr.ConnectorId -split '/apis/')[-1]).Trim('/')
+          } elseif ($cr.PSObject.Properties.Name -contains 'ApiName') {
+            $apiName = $cr.ApiName
+          }
+          if(-not [string]::IsNullOrWhiteSpace($apiName)){
+            $apiVar = ("CRAPI_{0}" -f $apiName)
             $raw = Get-EnvCI $apiVar
           }
         }
 
         if([string]::IsNullOrWhiteSpace($raw)) {
-          $apiName = $apiName
-          if(-not $apiName){
-            if($cr.PSObject.Properties.Name -contains 'ConnectorId' -and $cr.ConnectorId){
-              $apiName = ($cr.ConnectorId -split '/apis/')[-1].Trim('/')
-            } elseif ($cr.PSObject.Properties.Name -contains 'ApiName'){ $apiName = $cr.ApiName }
+          # montar ApiName para mensagem
+          $apiNameMsg = $null
+          if($cr.PSObject.Properties.Name -contains 'ConnectorId' -and $cr.ConnectorId){
+            $apiNameMsg = (($cr.ConnectorId -split '/apis/')[-1]).Trim('/')
+          } elseif ($cr.PSObject.Properties.Name -contains 'ApiName') {
+            $apiNameMsg = $cr.ApiName
           }
-          $missing += [PSCustomObject]@{ LogicalName = $logical; ApiName = ($apiName ?? '(desconhecido)'); VarName = $varName }
+          if([string]::IsNullOrWhiteSpace($apiNameMsg)) { $apiNameMsg = '(desconhecido)' }
+          $missing += [PSCustomObject]@{ LogicalName = $logical; ApiName = $apiNameMsg; VarName = $varName }
           continue
         }
 
+        # aceitar GUID/nome puro ou resource-id completo
         $cid = $raw
-        if ($raw -match '/connections/(?<id>[^/\s]+)') { $cid = $Matches['id'] }
+        $m = [regex]::Match($raw, '/connections/(?<id>[^/\s]+)')
+        if($m.Success){ $cid = $m.Groups['id'].Value }
 
         if ([string]::IsNullOrWhiteSpace($cid)) {
-          Write-Warning "Valor inválido em $varName"
-          $missing += [PSCustomObject]@{ LogicalName = $logical; ApiName = $apiName; VarName = $varName }
+          Write-Warning ("Valor inválido em {0}" -f $varName)
+          # descobrir ApiName para a mensagem
+          $apiNameWarn = $null
+          if($cr.PSObject.Properties.Name -contains 'ConnectorId' -and $cr.ConnectorId){
+            $apiNameWarn = (($cr.ConnectorId -split '/apis/')[-1]).Trim('/')
+          } elseif ($cr.PSObject.Properties.Name -contains 'ApiName') {
+            $apiNameWarn = $cr.ApiName
+          }
+          if([string]::IsNullOrWhiteSpace($apiNameWarn)) { $apiNameWarn = '(desconhecido)' }
+          $missing += [PSCustomObject]@{ LogicalName = $logical; ApiName = $apiNameWarn; VarName = $varName }
         } else {
           $cr.ConnectionId = $cid
-          Write-Host "CR [$logical] = $cid (via variável)"
+          Write-Host ("CR [{0}] = {1} (via variável)" -f $logical, $cid)
         }
       }
 
-      # Salvar
+      # salvar de volta
       $json | ConvertTo-Json -Depth 20 | Out-File -FilePath $settingsPath -Encoding utf8
       Write-Host "Settings atualizado: $settingsPath"
 
@@ -164,6 +180,7 @@ steps:
       } else {
         Write-Host "Todas as Connection References foram vinculadas via variáveis."
       }
+
 
 
 - task: PowerShell@2
