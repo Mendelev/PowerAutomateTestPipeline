@@ -228,7 +228,20 @@ steps:
 
       $missing = @($json.ConnectionReferences | Where-Object { -not $_.ConnectionId })
       if($missing.Count -gt 0){
-        $list = ($missing | ForEach-Object { "$($_.ApiName ?? ($_.ConnectorId -split '/')[-1]) [$($_.LogicalName)]" }) -join '; '
+        # Constrói o label de cada item sem usar '??'
+        $labels = @()
+        foreach($m in $missing){
+          $api = $null
+          if ($m.PSObject.Properties.Name -contains 'ApiName' -and $m.ApiName) {
+            $api = $m.ApiName
+          } elseif ($m.PSObject.Properties.Name -contains 'ConnectorId' -and $m.ConnectorId) {
+            $api = ($m.ConnectorId -split '/')[-1]
+          } else {
+            $api = '<api-desconhecida>'
+          }
+          $labels += ("{0} [{1}]" -f $api, $m.LogicalName)
+        }
+        $list = ($labels -join '; ')
         throw "Ainda faltam connections para: $list. Crie 1 por conector OU defina CR_<LogicalName> nas variáveis e rode novamente."
       } else {
         Write-Host "Todas as Connection References foram resolvidas."
