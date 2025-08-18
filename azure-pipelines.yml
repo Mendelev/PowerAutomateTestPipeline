@@ -99,34 +99,23 @@ steps:
 
       # --- Connection References: usar CR_<LogicalName>
       $missing = @()
-      foreach($cr in ($json.ConnectionReferences | Where-Object { $_ })) {
-        if ($cr.ConnectionId) { continue }
-
-        $logical = $cr.LogicalName
-        $varName = "CR_{0}" -f $logical
-        $raw     = [Environment]::GetEnvironmentVariable($varName, 'Process')
-
-        if([string]::IsNullOrWhiteSpace($raw)) {
-          # coletar info pra mensagem de ajuda
-          $apiName = if ($cr.PSObject.Properties.Name -contains 'ConnectorId' -and $cr.ConnectorId) {
-            ($cr.ConnectorId -split '/apis/')[-1].Trim('/')
-          } elseif ($cr.PSObject.Properties.Name -contains 'ApiName') { $cr.ApiName } else { "(desconhecido)" }
-          $missing += [PSCustomObject]@{ LogicalName = $logical; ApiName = $apiName; VarName = $varName }
-          continue
-        }
-
-        # aceitar GUID puro ou resource-id (/providers/.../connections/<id>)
+      # --- Fallback por ApiName: CRAPI_<ApiName>, ex.: CRAPI_shared_msnweather
+      foreach($cr in ($json.ConnectionReferences | Where-Object { $_ -and -not $_.ConnectionId })) {
+        $apiName = $null
+        if($cr.PSObject.Properties.Name -contains 'ConnectorId' -and $cr.ConnectorId){
+          $apiName = ($cr.ConnectorId -split '/apis/')[-1].Trim('/')
+        } elseif ($cr.PSObject.Properties.Name -contains 'ApiName') { $apiName = $cr.ApiName }        
+        if([string]::IsNullOrWhiteSpace($apiName)){ continue }        
+        $apiVar = "CRAPI_{0}" -f $apiName
+        $raw    = [Environment]::GetEnvironmentVariable($apiVar, 'Process')
+        if([string]::IsNullOrWhiteSpace($raw)){ continue }        
         $cid = $raw
         if ($raw -match '/connections/(?<id>[^/\s]+)') { $cid = $Matches['id'] }
-
-        if ([string]::IsNullOrWhiteSpace($cid)) {
-          Write-Warning "Valor inválido em $varName"
-          $missing += [PSCustomObject]@{ LogicalName = $logical; ApiName = $apiName; VarName = $varName }
-        } else {
-          $cr.ConnectionId = $cid
-          Write-Host "CR [$logical] = $cid (via $varName)"
-        }
+        if ([string]::IsNullOrWhiteSpace($cid)) { continue }        
+        $cr.ConnectionId = $cid
+        Write-Host "CR [$($cr.LogicalName)] = $cid (via $apiVar)"
       }
+
 
       # Salvar o settings atualizado
       $json | ConvertTo-Json -Depth 20 | Out-File -FilePath $settingsPath -Encoding utf8
