@@ -2,206 +2,92 @@ trigger:
 - main
 
 pool:
-  vmImage: 'windows-latest'
-
-variables:
-  # (Opcional) force overrides em caso de mais de uma connection para o mesmo connector
-  # Formato: ConnectorName=ConnectionId;ConnectorName2=ConnectionId2
-  CROverrides: ''  
+  vmImage: windows-latest   # pode ser ubuntu-latest também
 
 steps:
+# 1) PAC no PATH
 - task: PowerPlatformToolInstaller@2
   displayName: 'Power Platform Tool Installer'
   inputs:
     DefaultVersion: true
-    AddToolsToPath: true
+    AddToolsToPath: true     # deixa 'pac' acessível nas próximas etapas
 
-# 1) Instala o PAC CLI (para gerar o settings) e módulos PowerShell
+# 2) Seleciona o ZIP mais recente do repo e define $(SolutionZip)
 - task: PowerShell@2
-  displayName: 'Carregar módulos Power Platform (idempotente)'
-  inputs:
-    targetType: inline
-    script: |
-      $ErrorActionPreference = 'Stop'
-      # Evita prompt de repositório não confiável (alguns agentes mostram)
-      try { Set-PSRepository -Name PSGallery -InstallationPolicy Trusted -ErrorAction Stop } catch {}
-
-      $mods = @(
-        'Microsoft.PowerApps.Administration.PowerShell', # Admin cmdlets (Get-Admin*, Enable-AdminFlow, etc.)
-        'Microsoft.PowerApps.PowerShell'                 # Maker cmdlets (Add-PowerAppsAccount, etc.)
-      )
-
-      foreach ($m in $mods) {
-        if (Get-Module -ListAvailable -Name $m) {
-          Write-Host "Módulo $m já disponível. Importando..."
-          Import-Module $m -Force -ErrorAction Stop
-        } else {
-          Write-Host "Instalando $m (CurrentUser, AllowClobber)..."
-          Install-Module $m -Scope CurrentUser -Force -AllowClobber
-          Import-Module $m -Force -ErrorAction Stop
-        }
-      }
-
-      # Sanidade: mostre versões carregadas
-      Get-Module Microsoft.PowerApps.* | Format-Table Name, Version
-# 2) Escolhe o ZIP mais recente do repositório e salva como solution.zip
-- task: PowerShell@2
-  displayName: 'Selecionar o .zip da solução'
+  displayName: 'Selecionar ZIP'
   inputs:
     targetType: 'inline'
     script: |
       $root = "$(Build.SourcesDirectory)"
       $zips = Get-ChildItem -Path $root -Recurse -Filter *.zip | Sort-Object LastWriteTime -Descending
-      if(-not $zips){ throw "Nenhum .zip encontrado" }
+      if(-not $zips){ throw "Nenhum .zip encontrado em $root" }
       $picked = $zips[0].FullName
       New-Item -ItemType Directory -Force -Path "$(Build.ArtifactStagingDirectory)" | Out-Null
-      Copy-Item $picked "$(Build.ArtifactStagingDirectory)\solution.zip" -Force
-      Write-Host "##vso[task.setvariable variable=SolutionZip]$(Build.ArtifactStagingDirectory)\solution.zip"
-      Write-Host "ZIP escolhido: $picked"
+      $dest = Join-Path "$(Build.ArtifactStagingDirectory)" "solution.zip"
+      Copy-Item $picked $dest -Force
+      Write-Host "##vso[task.setvariable variable=SolutionZip]$dest"
+      Write-Host "Selecionado: $picked -> $dest"
 
-# 3) Gera o deployment.settings.json (EVs + ConnectionReferences)
+# 3) Gera o deployment.settings.json (descobre EVs + CRs do ZIP)
 - task: PowerShell@2
   displayName: 'Gerar deployment.settings.json (PAC CLI)'
   inputs:
-    targetType: inline
+    targetType: 'inline'
     script: |
       $ErrorActionPreference = 'Stop'
       pac --version
       $zip = "$(SolutionZip)"
       $out = "$(Build.ArtifactStagingDirectory)/deployment.settings.json"
       pac solution create-settings --solution-zip $zip --settings-file $out
+      if(!(Test-Path $out)){ throw "Falha ao gerar settings file" }
       Write-Host "##vso[task.setvariable variable=DeploymentSettingsFile]$out"
       Write-Host "Gerado: $out"
 
-# 4) Puxa variáveis da sua Service Connection do Power Platform (para reuso no login)
-- task: PowerPlatformSetConnectionVariables@2
-  displayName: 'Set Connection Vars (Power Platform SPN)'
-  inputs:
-    authenticationType: 'PowerPlatformSPN'
-    PowerPlatformSPN: 'Teste-Pipeline-PowerAutomate'  # <-- sua service connection
-
-# 5) AUTO-BIND das ConnectionReferences -> procura connections existentes e preenche o settings.json
+# 4) Preenche automaticamente os valores a partir de variáveis do pipeline
+#    Convenção:
+#    - EV_<SchemaName>         -> EnvironmentVariables[].Value
+#    - CR_<LogicalName>        -> ConnectionReferences[].ConnectionId
 - task: PowerShell@2
-  displayName: 'Auto-bind ConnectionReferences no settings.json'
+  displayName: 'Preencher settings com variáveis do pipeline'
   inputs:
     targetType: 'inline'
     script: |
       $ErrorActionPreference = 'Stop'
-      $settingsPath = "$(DeploymentSettingsFile)"
-      $envUrl = "$(BuildTools.EnvironmentUrl)"  # vem da task SetConnectionVariables
-      if(-not $envUrl){ $envUrl = "$(PowerPlatform.EnvironmentUrl)" }  # fallback
-      
-      # Login com o mesmo SPN da Service Connection
-      $tenantId = "$(PowerPlatform.TenantId)"
-      $appId    = "$(PowerPlatform.ApplicationId)"
-      $secret   = "$(PowerPlatform.ClientSecret)"
-      Add-PowerAppsAccount -TenantID $tenantId -ApplicationId $appId -ClientSecret $secret | Out-Null
+      $path = "$(DeploymentSettingsFile)"
+      $json = Get-Content $path -Raw | ConvertFrom-Json
 
-      # Descobre o EnvironmentName a partir da URL
-      $env = Get-AdminPowerAppEnvironment | Where-Object {
-        $_.Properties.linkedEnvironmentMetadata.instanceUrl -eq $envUrl -or
-        $_.Properties.linkedEnvironmentMetadata.instanceUrl -like "$envUrl*"
-      } | Select-Object -First 1
-      if(-not $env){ throw "Não foi possível localizar o Environment pelo URL '$envUrl'." }
-      $envName = $env.EnvironmentName
-      Write-Host "EnvironmentName: $envName"
-
-      # Carrega settings
-      $json = Get-Content $settingsPath -Raw | ConvertFrom-Json
-
-      # Overrides opcionais (ConnectorName=ConnectionId;...)
-      $overridesRaw = "$(CROverrides)"
-      $overrides = @{}
-      if($overridesRaw){
-        $overridesRaw.Split(';') | ForEach-Object {
-          if($_ -match '='){
-            $k,$v = $_.Split('=',2)
-            $overrides[$k.Trim()] = $v.Trim()
-          }
-        }
-      }
-
-      # Para cada ConnectionReference -> preenche ConnectionId automaticamente
-      foreach($cr in $json.ConnectionReferences){
-        # O PAC coloca algo como "/providers/Microsoft.PowerApps/apis/shared_sharepointonline"
-        $connectorName = ($cr.ConnectorId -split '/')[-1]
-        
-        if($overrides.ContainsKey($connectorName)){
-          $cr.ConnectionId = $overrides[$connectorName]
-          Write-Host "CR [$($cr.LogicalName)] -> override ($connectorName) = $($cr.ConnectionId)"
-          continue
-        }
-
-        # Lista connections existentes desse connector no ambiente
-        $conns = Get-AdminPowerAppConnection -ConnectorName $connectorName -EnvironmentName $envName
-        if(-not $conns){
-          Write-Warning "Nenhuma connection encontrada para '$connectorName' no ambiente '$envName'."
-          continue
-        }
-
-        # Heurística: pega a primeira 'Connected'. Se quiser, adicione mais filtros (CreatedBy/Owner)
-        $chosen = $conns | Where-Object { $_.Status -eq 'Connected' } | Select-Object -First 1
-        if(-not $chosen){ $chosen = $conns | Select-Object -First 1 }
-
-        if($chosen){
-          # O id da connection é a propriedade Name
-          $cr.ConnectionId = $chosen.Name
-          Write-Host "CR [$($cr.LogicalName)] -> $connectorName = $($cr.ConnectionId) ($($chosen.Status))"
-        } else {
-          Write-Warning "Connections encontradas para '$connectorName', mas nenhuma selecionada."
-        }
-      }
-
-      # (Opcional) Preencha EnvironmentVariables a partir de variáveis de pipeline:
-      # Use naming convention: EV.<SchemaName>
+      # EVs
       foreach($ev in $json.EnvironmentVariables){
         $schema = $ev.SchemaName
-        $varName = "EV.$schema"
+        $varName = "EV_{0}" -f $schema
         $val = [Environment]::GetEnvironmentVariable($varName, 'Process')
         if([string]::IsNullOrWhiteSpace($val)){ continue }
         $ev.Value = $val
         Write-Host "EV [$schema] = $val"
       }
 
-      # Salva
-      $json | ConvertTo-Json -Depth 20 | Out-File -FilePath $settingsPath -Encoding utf8
-      Write-Host "Settings atualizado: $settingsPath"
+      # Connection References
+      foreach($cr in $json.ConnectionReferences){
+        $logical = $cr.LogicalName
+        $varName = "CR_{0}" -f $logical
+        $connId = [Environment]::GetEnvironmentVariable($varName, 'Process')
+        if([string]::IsNullOrWhiteSpace($connId)){ continue }
+        $cr.ConnectionId = $connId
+        Write-Host "CR [$logical] = $connId"
+      }
 
-# 6) Importa a solução usando o settings file
+      $json | ConvertTo-Json -Depth 20 | Out-File -FilePath $path -Encoding utf8
+      Write-Host "Settings atualizado: $path"
+
+# 5) Importa usando o settings file (faz o bind de EVs e CRs)
 - task: PowerPlatformImportSolution@2
-  displayName: 'Importar solução (com settings file)'
+  displayName: 'Import Solution (com settings)'
   inputs:
     authenticationType: 'PowerPlatformSPN'
-    PowerPlatformSPN: 'Teste-Pipeline-PowerAutomate'
+    PowerPlatformSPN: 'Teste-Pipeline-PowerAutomate'    # sua service connection Power Platform (WIF)
     SolutionInputFile: '$(SolutionZip)'
     UseDeploymentSettingsFile: true
     DeploymentSettingsFile: '$(DeploymentSettingsFile)'
     AsyncOperation: true
     MaxAsyncWaitTime: '60'
-    StageAndUpgrade: false
-
-# 7) Liga os fluxos da solução (Enable-AdminFlow)
-- task: PowerShell@2
-  displayName: 'Ligar fluxos da solução'
-  inputs:
-    targetType: 'inline'
-    script: |
-      $tenantId = "$(PowerPlatform.TenantId)"
-      $appId    = "$(PowerPlatform.ApplicationId)"
-      $secret   = "$(PowerPlatform.ClientSecret)"
-      Add-PowerAppsAccount -TenantID $tenantId -ApplicationId $appId -ClientSecret $secret | Out-Null
-
-      $envName = (Get-AdminPowerAppEnvironment | Where-Object {
-        $_.Properties.linkedEnvironmentMetadata.instanceUrl -eq "$(BuildTools.EnvironmentUrl)"
-      }).EnvironmentName
-
-      # Pegue só os flows da solução que você está implantando (ajuste UniqueName se quiser filtrar)
-      $flows = Get-AdminFlow -EnvironmentName $envName
-      foreach($f in $flows){
-        try{
-          Enable-AdminFlow -EnvironmentName $envName -FlowName $f.FlowName -ErrorAction Stop
-          Write-Host "Ligado: $($f.DisplayName)"
-        } catch {
-          Write-Warning "Não foi possível ligar $($f.DisplayName): $($_.Exception.Message)"
-        }
-      }
+    StageAndUpgrade: false   # ON só nos upgrades, depois da 1ª instalação
