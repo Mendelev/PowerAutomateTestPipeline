@@ -93,75 +93,98 @@ steps:
       if (!(Test-Path $settingsPath)) { throw "Settings file não encontrado: $settingsPath" }
       $json = Get-Content $settingsPath -Raw | ConvertFrom-Json
 
-      $provUrl   = $env:ProvisionerUrl
-      $envUrl    = $env:TargetEnvironmentUrl
-      $spObjId   = $env:ServicePrincipalObjectId  # opcional, use se o Flow fizer compartilhamento
+      $provUrl = $env:ProvisionerUrl
+      $envUrl  = $env:TargetEnvironmentUrl
+      $spObjId = $env:ServicePrincipalObjectId  # opcional, use se o Flow fizer compartilhamento
 
       if ([string]::IsNullOrWhiteSpace($provUrl)) { throw "ProvisionerUrl (env) não definido." }
       if (-not [Uri]::IsWellFormedUriString($provUrl, [UriKind]::Absolute)) { throw "ProvisionerUrl inválido: $provUrl" }
       if ([string]::IsNullOrWhiteSpace($envUrl)) { throw "TargetEnvironmentUrl (env) não definido." }
 
       # 1) EVs via EV_<SchemaName>
-      foreach($ev in ($json.EnvironmentVariables | Where-Object { $_ })) {
-        $schema = $ev.SchemaName
-        $vName  = "EV_{0}" -f $schema
-        $val    = [Environment]::GetEnvironmentVariable($vName, 'Process')
-        if([string]::IsNullOrWhiteSpace($val)) { continue }
-        $ev.Value = $val
-        Write-Host "EV [$schema] = $val"
+      if ($json.EnvironmentVariables) {
+        foreach($ev in $json.EnvironmentVariables){
+          if(-not $ev){ continue }
+          $schema = $ev.SchemaName
+          $vName  = "EV_{0}" -f $schema
+          $val    = [Environment]::GetEnvironmentVariable($vName, 'Process')
+          if([string]::IsNullOrWhiteSpace($val)) { continue }
+          $ev.Value = $val
+          Write-Host "EV [$schema] = $val"
+        }
       }
 
-      # 2) Monta lista de CRs que ainda não têm ConnectionId (respeita overrides CR_<LogicalName>)
+      # 2) Lista de CRs sem ConnectionId (respeita overrides CR_<LogicalName>)
       $needed = @()
-      foreach($cr in ($json.ConnectionReferences | Where-Object { $_ })) {
-        if ($cr.ConnectionId) { continue }
-        $override = [Environment]::GetEnvironmentVariable(("CR_{0}" -f $cr.LogicalName), 'Process')
-        if ($override) { $cr.ConnectionId = $override; Write-Host "CR [$($cr.LogicalName)] override = $override"; continue }
+      foreach($cr in $json.ConnectionReferences){
+        if(-not $cr){ continue }
+        if($cr.ConnectionId){ continue }
 
-        # Inferir apiName (shared_xxx) a partir de ConnectorId
+        $override = [Environment]::GetEnvironmentVariable(("CR_{0}" -f $cr.LogicalName), 'Process')
+        if($override){
+          $cr.ConnectionId = $override
+          Write-Host "CR [$($cr.LogicalName)] override = $override"
+          continue
+        }
+
+        # Inferir apiName
         $apiName = $null
         if ($cr.PSObject.Properties.Name -contains 'ConnectorId' -and $cr.ConnectorId) { $apiName = ($cr.ConnectorId -split '/')[-1] }
-        elseif ($cr.PSObject.Properties.Name -contains 'ApiName' -and $cr.ApiName) { $apiName = $cr.ApiName }
-        if ([string]::IsNullOrWhiteSpace($apiName)) { Write-Warning "Não consegui inferir apiName p/ CR [$($cr.LogicalName)]"; continue }
+        elseif ($cr.PSObject.Properties.Name -contains 'ApiName' -and $cr.ApiName)     { $apiName = $cr.ApiName }
+
+        if ([string]::IsNullOrWhiteSpace($apiName)) {
+          Write-Warning "Não consegui inferir apiName p/ CR [$($cr.LogicalName)]"
+          continue
+        }
 
         $needed += [PSCustomObject]@{ logicalName = $cr.LogicalName; apiName = $apiName }
       }
 
-      if ($needed.Count -eq 0) {
-        Write-Host "Nenhuma Connection Reference pendente. Nada a fazer."
-      } else {
+      if ($needed.Count -gt 0) {
         # 3) Chama o Flow provisionador
         $payload = @{
           targetEnvironmentUrl = $envUrl
           principalObjectId    = $spObjId   # se seu Flow usar; senão, pode omitir
           connectors           = $needed     # [{ logicalName, apiName }]
-        } | ConvertTo-Json -Depth 5
+        } | ConvertTo-Json -Depth 6
 
-        Write-Host "Chamando Flow provisionador em $provUrl ..."
+        Write-Host "POST $provUrl"
         $resp = Invoke-RestMethod -Method POST -Uri $provUrl -ContentType 'application/json' -Body $payload
 
-        # Espera formato: { "bindings":[{"logicalName":"...", "connectionId":"..."}], "missing":[{"logicalName":"...","apiName":"...","reason":"requires_auth|not_found"}] }
+        # Esperado: { bindings:[{logicalName,apiName,connectionId}], missing:[{logicalName,apiName,reason}] }
         $bindings = @()
-        $missing  = @()
-        if ($resp.PSObject.Properties.Name -contains 'bindings' -and $resp.bindings) { $bindings = @($resp.bindings) }
-        if ($resp.PSObject.Properties.Name -contains 'missing'  -and $resp.missing)  { $missing  = @($resp.missing)  }
+        if ($resp -and $resp.PSObject.Properties.Name -contains 'bindings' -and $resp.bindings) { $bindings = @($resp.bindings) }
 
         foreach($b in $bindings){
           $cr = $json.ConnectionReferences | Where-Object { $_.LogicalName -eq $b.logicalName } | Select-Object -First 1
-          if ($cr) { $cr.ConnectionId = $b.connectionId; Write-Host "CR [$($b.logicalName)] <- $($b.connectionId)" }
+          if($cr){
+            $cr.ConnectionId = $b.connectionId
+            Write-Host "CR [$($b.logicalName)] <- $($b.connectionId)"
+          }
         }
 
+        $missing = @()
+        if ($resp -and $resp.PSObject.Properties.Name -contains 'missing' -and $resp.missing) { $missing = @($resp.missing) }
+
         if ($missing.Count -gt 0){
-          Write-Host "Connections pendentes (Flow reportou como 'missing'):"
-          $missing | Format-Table
-          $list = ($missing | ForEach-Object { "{0} [{1}] - {2}" -f $_.apiName, $_.logicalName, ($_.reason ?? 'unknown') }) -join '; '
+          Write-Host "Connections pendentes (Flow reportou 'missing'):"
+          $labels = @()
+          foreach($m in $missing){
+            $reason = $m.reason
+            if ([string]::IsNullOrWhiteSpace($reason)) { $reason = 'unknown' }
+            $labels += ("{0} [{1}] - {2}" -f $m.apiName, $m.logicalName, $reason)
+          }
+          $list = ($labels -join '; ')
           throw "Ainda faltam connections: $list. Crie uma connection no ambiente OU passe CR_<LogicalName> como variável e rode de novo."
         }
+      } else {
+        Write-Host "Nenhuma Connection Reference pendente."
       }
 
       # 4) Salva settings
       $json | ConvertTo-Json -Depth 20 | Out-File -FilePath $settingsPath -Encoding utf8
       Write-Host "Settings atualizado: $settingsPath"
+
 
 
 # 6) Importa usando o settings
