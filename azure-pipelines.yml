@@ -83,17 +83,33 @@ steps:
 
 # 5) 🔎 AUTO-DISCOVERY de connections + preenchimento de EVs
 - task: PowerShell@2
-  displayName: 'Auto-discovery de connections e preenchimento do settings (robusto)'
+  displayName: 'Auto-discovery de connections e preenchimento do settings (robusto, sem $$())'
   inputs:
     targetType: 'inline'
     script: |
       $ErrorActionPreference = 'Stop'
 
-      $settingsPath = "$(DeploymentSettingsFile)"
-      if(!(Test-Path $settingsPath)){ throw "Settings file não encontrado: $settingsPath" }
+      # --- caminhos/entrada ---
+      $settingsPath = "$(DeploymentSettingsFile)"                # esta existe
+      if (!(Test-Path $settingsPath)) { throw "Settings file não encontrado: $settingsPath" }
       $json = Get-Content $settingsPath -Raw | ConvertFrom-Json
 
-      # ----- 1) Preencher EVs por variáveis EV_<SchemaName> -----
+      # Leia variáveis pela ENV (não explode se não existirem)
+      $targetUrl    = $env:TargetEnvironmentUrl
+      $targetName   = $env:TargetEnvironmentName    # opcional
+      $preferUpn    = $env:PreferOwnerUpn           # opcional
+      $provUrl      = $env:ProvisionerUrl           # opcional (não usamos aqui)
+      $noAuthList   = @()
+      if ($env:NoAuthApiNames) { $noAuthList = $env:NoAuthApiNames.Split(';',[System.StringSplitOptions]::RemoveEmptyEntries) | ForEach-Object { $_.Trim() } }
+
+      $tenant = $env:PP_TenantId
+      $app    = $env:PP_AppId
+      $secret = $env:PP_ClientSecret
+
+      if ([string]::IsNullOrWhiteSpace($targetUrl)) { throw "TargetEnvironmentUrl (env) não definido." }
+      $targetUrl = $targetUrl.TrimEnd('/')
+
+      # --- 1) EVs via EV_<SchemaName> ---
       foreach($ev in ($json.EnvironmentVariables | Where-Object { $_ })) {
         $schema = $ev.SchemaName
         $vName  = "EV_{0}" -f $schema
@@ -103,10 +119,9 @@ steps:
         Write-Host "EV [$schema] = $val"
       }
 
-      # ----- 2) Login com SPN para discovery (Admin cmdlets) -----
-      $tenant = "$(PP_TenantId)"; $app = "$(PP_AppId)"; $secret = "$(PP_ClientSecret)"
-      if([string]::IsNullOrWhiteSpace($tenant) -or [string]::IsNullOrWhiteSpace($app) -or [string]::IsNullOrWhiteSpace($secret)){
-        throw "PP_* não definidos. Para o modo discovery, defina PP_TenantId, PP_AppId e PP_ClientSecret (secure)."
+      # --- 2) Login com SPN (cmdlets Admin) ---
+      if ([string]::IsNullOrWhiteSpace($tenant) -or [string]::IsNullOrWhiteSpace($app) -or [string]::IsNullOrWhiteSpace($secret)) {
+        throw "PP_TenantId / PP_AppId / PP_ClientSecret não definidos (env). Defina para habilitar o discovery."
       }
 
       try { Set-PSRepository -Name PSGallery -InstallationPolicy Trusted -ErrorAction Stop } catch {}
@@ -115,12 +130,9 @@ steps:
       }
       Add-PowerAppsAccount -TenantID $tenant -ApplicationId $app -ClientSecret $secret | Out-Null
 
-      # ----- 3) Resolver o ambiente (robusto) -----
-      $targetUrl = "$(TargetEnvironmentUrl)".TrimEnd('/')
-      $targetName = "$(TargetEnvironmentName)"  # opcional: ex. 'Default-12345678-...'
+      # --- 3) Resolver ambiente (robusto) ---
       $envs = Get-AdminPowerAppEnvironment
-
-      if(-not $envs){ throw "Nenhum ambiente retornado. Verifique permissões do app (Power Platform Administrator) OU adicione-o como Application user ao ambiente." }
+      if(-not $envs){ throw "Nenhum ambiente retornado. Verifique permissões do app (Power Platform Admin) OU adicione como Application user (System Administrator) no ambiente." }
 
       Write-Host "Ambientes visíveis pelo SPN:"
       $envs | Select-Object EnvironmentName,DisplayName,Location | Format-Table
@@ -130,60 +142,37 @@ steps:
         $env = $envs | Where-Object { $_.EnvironmentName -eq $targetName } | Select-Object -First 1
         if($env){ Write-Host "Encontrado por TargetEnvironmentName: $($env.EnvironmentName) / $($env.DisplayName)" }
       }
-
       if(-not $env){
-        # Normaliza host; tenta achar em qualquer campo do linkedEnvironmentMetadata
         $host = ([Uri]$targetUrl).Host
         foreach($e in $envs){
           $lem = $e.Properties.linkedEnvironmentMetadata
           if(-not $lem){ continue }
-          # Converte propriedades em texto e tenta 'contains' do host
           $lemJson = ($lem | ConvertTo-Json -Depth 10)
-          if($lemJson -match [Regex]::Escape($host)){
-            $env = $e; break
-          }
+          if($lemJson -match [Regex]::Escape($host)){ $env = $e; break }
         }
       }
-
       if(-not $env){
-        # Último fallback: tente campos "comuns"
         foreach($e in $envs){
-          $p = $e.Properties
-          $candidatos = @()
-          if($p -and $p.linkedEnvironmentMetadata){
-            $lem = $p.linkedEnvironmentMetadata
-            $candidatos += @(
-              $lem.instanceUrl,
-              $lem.baseApiUrl,
-              $lem.organizationUrl,
-              $lem.instancesApiUrl,
-              $lem.dataverseUrl
-            )
-          }
-          if($candidatos | Where-Object { $_ -and $_.ToString().TrimEnd('/') -eq $targetUrl }){
-            $env = $e; break
-          }
+          $lem = $e.Properties.linkedEnvironmentMetadata
+          if(-not $lem){ continue }
+          $cands = @($lem.instanceUrl,$lem.baseApiUrl,$lem.organizationUrl,$lem.instancesApiUrl,$lem.dataverseUrl) | Where-Object { $_ }
+          if($cands | Where-Object { $_.ToString().TrimEnd('/') -eq $targetUrl }) { $env = $e; break }
         }
       }
-
       if(-not $env){
-        # Ajuda de diagnóstico
         Write-Warning "Não achei ambiente pelo URL: $targetUrl"
-        Write-Host "Dica: informe TargetEnvironmentName para evitar ambiguidade (ex.: 'Default-xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx')."
-        throw "Environment não encontrado. Revise: TargetEnvironmentUrl, tenant (PP_TenantId) e permissões do app."
+        Write-Host "Dica: defina TargetEnvironmentName (env var) ex.: 'Default-xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx'."
+        throw "Environment não encontrado. Revise URL, tenant (PP_TenantId) e permissões do app."
       }
 
       $envName = $env.EnvironmentName
       Write-Host "Environment resolvido: $envName / $($env.DisplayName)"
 
-      # ----- 4) Fazer o bind das Connection References -----
-      # Preferência opcional: priorizar connections de um UPN específico
-      $preferUpn = "$(PreferOwnerUpn)"
-
+      # --- 4) Bind das Connection References ---
       foreach($cr in ($json.ConnectionReferences | Where-Object { $_ })) {
         if($cr.ConnectionId){ Write-Host "CR [$($cr.LogicalName)] já tem ConnectionId."; continue }
 
-        # Override por variável CR_<LogicalName>, se houver
+        # override via CR_<LogicalName>
         $override = [Environment]::GetEnvironmentVariable(("CR_{0}" -f $cr.LogicalName), 'Process')
         if($override){
           $cr.ConnectionId = $override
@@ -191,15 +180,11 @@ steps:
           continue
         }
 
-        # Descobrir apiName
+        # apiName
         $apiName = $null
         if($cr.PSObject.Properties.Name -contains 'ConnectorId' -and $cr.ConnectorId) { $apiName = ($cr.ConnectorId -split '/')[-1] }
         elseif ($cr.PSObject.Properties.Name -contains 'ApiName' -and $cr.ApiName)     { $apiName = $cr.ApiName }
-
-        if([string]::IsNullOrWhiteSpace($apiName)){
-          Write-Warning "Não consegui inferir apiName para CR [$($cr.LogicalName)]. Pulei."
-          continue
-        }
+        if([string]::IsNullOrWhiteSpace($apiName)){ Write-Warning "Sem apiName p/ CR [$($cr.LogicalName)]"; continue }
 
         $conns = Get-AdminPowerAppConnection -EnvironmentName $envName -ConnectorName $apiName -ErrorAction SilentlyContinue
         if(-not $conns){
@@ -208,27 +193,24 @@ steps:
         }
 
         $chosen = $null
-        if($preferUpn){
-          $chosen = $conns | Where-Object { $_.Status -eq 'Connected' -and $_.CreatedBy.userPrincipalName -eq $preferUpn } | Select-Object -First 1
-        }
+        if($preferUpn){ $chosen = $conns | Where-Object { $_.Status -eq 'Connected' -and $_.CreatedBy.userPrincipalName -eq $preferUpn } | Select-Object -First 1 }
         if(-not $chosen){ $chosen = $conns | Where-Object { $_.Status -eq 'Connected' } | Select-Object -First 1 }
         if(-not $chosen){ $chosen = $conns | Select-Object -First 1 }
 
         if($chosen){
-          $cr.ConnectionId = $chosen.Name  # GUID da connection
+          $cr.ConnectionId = $chosen.Name  # GUID
           Write-Host "CR [$($cr.LogicalName)] -> $apiName = $($cr.ConnectionId) ($($chosen.Status))"
         } else {
           Write-Warning "Connections existem para $apiName, mas nenhuma selecionada."
         }
       }
 
-      # ----- 5) Salvar settings e validar pendências -----
+      # --- 5) Salvar e validar pendências (compatível com PS 5.1) ---
       $json | ConvertTo-Json -Depth 20 | Out-File -FilePath $settingsPath -Encoding utf8
       Write-Host "Settings atualizado: $settingsPath"
 
       $missing = @($json.ConnectionReferences | Where-Object { -not $_.ConnectionId })
       if($missing.Count -gt 0){
-        # Constrói o label de cada item sem usar '??'
         $labels = @()
         foreach($m in $missing){
           $api = $null
@@ -236,9 +218,7 @@ steps:
             $api = $m.ApiName
           } elseif ($m.PSObject.Properties.Name -contains 'ConnectorId' -and $m.ConnectorId) {
             $api = ($m.ConnectorId -split '/')[-1]
-          } else {
-            $api = '<api-desconhecida>'
-          }
+          } else { $api = '<api-desconhecida>' }
           $labels += ("{0} [{1}]" -f $api, $m.LogicalName)
         }
         $list = ($labels -join '; ')
