@@ -60,11 +60,16 @@ steps:
       $envUrl       = "$(TargetEnvironmentUrl)"
       $provUrl      = "$(ProvisionerUrl)"
       $spObjId      = "$(ServicePrincipalObjectId)"
+
       if(!(Test-Path $settingsPath)){ throw "Settings file não encontrado: $settingsPath" }
+      if([string]::IsNullOrWhiteSpace($provUrl)){ throw "ProvisionerUrl não definido." }
+      if(-not [Uri]::IsWellFormedUriString($provUrl, [UriKind]::Absolute)){ throw "ProvisionerUrl inválido: $provUrl" }
+
+      Write-Host "ProvisionerUrl: $($provUrl.Substring(0,[Math]::Min($provUrl.Length,60)))..."
 
       $json = Get-Content $settingsPath -Raw | ConvertFrom-Json
 
-      # 4.1 Preenche EVs a partir das variáveis EV_<SchemaName>
+      # 1) EVs via EV_<SchemaName>
       if($json.EnvironmentVariables){
         foreach($ev in $json.EnvironmentVariables){
           $schema = $ev.SchemaName
@@ -76,11 +81,11 @@ steps:
         }
       }
 
-      # 4.2 Para cada Connection Reference:
+      # 2) CRs – cria automaticamente via Flow apenas quando não há ConnectionId nem CR_<LogicalName>
       $missing = @()
       foreach($cr in $json.ConnectionReferences){
         $logical = $cr.LogicalName
-        # Se já vier mapeado por variável CR_<LogicalName>, usa.
+
         $preConn = [Environment]::GetEnvironmentVariable(("CR_{0}" -f $logical), 'Process')
         if($preConn){
           $cr.ConnectionId = $preConn
@@ -88,15 +93,12 @@ steps:
           continue
         }
 
-        # Se já tem ConnectionId no JSON, mantém
-        if($cr.ConnectionId){ 
+        if($cr.ConnectionId){
           Write-Host "CR [$logical] já possui ConnectionId no settings."
-          continue 
+          continue
         }
 
-        # Tenta provisionar conexão SEM autenticação (connectionParams = {}), via flow admin.
-        # O apiName vem do ConnectorId (ex.: .../apis/shared_msnweather)
-        $apiName = ($cr.ConnectorId -split '/')[-1]
+        $apiName = ($cr.ConnectorId -split '/')[-1]  # ex.: shared_msnweather
         $body = @{
           targetEnvironmentUrl = $envUrl
           apiName              = $apiName
@@ -115,19 +117,17 @@ steps:
             $missing += [PSCustomObject]@{ LogicalName = $logical; ApiName = $apiName; Motivo = "Flow sem retorno" }
           }
         } catch {
-          # Se o flow retornar 400, assumimos que o conector exige parâmetros/credenciais
-          $status = $_.Exception.Response.StatusCode.value__
-          $msg    = $_.Exception.Message
-          Write-Warning "Provisionamento falhou para [$logical]/$apiName - HTTP $status - $msg"
-          $missing += [PSCustomObject]@{ LogicalName = $logical; ApiName = $apiName; Motivo = "Requer auth/parâmetros" }
+          $msg = $_.Exception.Message
+          Write-Warning "Provisionamento falhou para [$logical]/$apiName - $msg"
+          $missing += [PSCustomObject]@{ LogicalName = $logical; ApiName = $apiName; Motivo = "Erro ao chamar ProvisionerUrl" }
         }
       }
 
-      # Salva o settings atualizado
+      # 3) Salva o settings
       $json | ConvertTo-Json -Depth 20 | Out-File -FilePath $settingsPath -Encoding utf8
       Write-Host "Settings atualizado: $settingsPath"
 
-      # Se ficou pendente algo (conectores com auth), falha com instruções claras
+      # 4) Se sobrou algo, falha com instrução objetiva
       if($missing.Count -gt 0){
         Write-Host "Connections que não puderam ser criadas automaticamente:"
         $missing | Format-Table
@@ -136,6 +136,7 @@ steps:
       } else {
         Write-Host "Todas as Connection References foram resolvidas (auto ou pré-definidas)."
       }
+
 
 # 5) Importa usando o settings file (faz o bind de EVs e CRs)
 - task: PowerPlatformImportSolution@2
