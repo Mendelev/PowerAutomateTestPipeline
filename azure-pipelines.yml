@@ -107,12 +107,53 @@ steps:
         }
       }
 
-      # --- Descobrir conexões existentes com PAC (sem Admin)
-      # Use -e (alias de --environment). --json retorna JSON parsável.
-      $raw = pac connection list -e $envUrl --json
-      try { $conns = $raw | ConvertFrom-Json } catch { throw "Falha ao ler lista de conexões do PAC. Saída: `n$raw" }
-      if(-not $conns){ throw "Nenhuma conexão retornada pelo PAC. Verifique permissões do App User no ambiente." }
+      # --- Descobrir conexões existentes com PAC (sem --json)
+      # Observação: 'pac connection list' não suporta saída JSON em algumas versões.
+      # Vamos capturar a saída em texto e extrair os resource-ids /apis/<apiName>/connections/<name>.
+      $out = & pac connection list -e $envUrl 2>&1
+      $txt = $out | Out-String
+      if ($LASTEXITCODE -ne 0) {
+        Write-Host $txt
+        throw "Falha ao executar 'pac connection list'."
+      }
 
+      # Parser 1: pega resource-ids completos, p.ex.:
+      # /providers/Microsoft.PowerApps/apis/shared_msnweather/connections/shared-msnweather-123
+      $connObjs = New-Object System.Collections.ArrayList
+      $ridPattern = '/providers/Microsoft\.PowerApps/apis/(?<api>[^/\s]+)/connections/(?<name>[^/\s]+)'
+      foreach($m in [regex]::Matches($txt, $ridPattern)){
+        [void]$connObjs.Add([pscustomobject]@{
+          apiName      = $m.Groups['api'].Value
+          name         = $m.Groups['name'].Value
+          connectionId = $m.Value
+        })
+      }
+
+      # Parser 2 (fallback): tabela em texto com "name" e "apiName" na mesma linha
+      # Se não conseguiu nenhum RID, tenta construir o RID a partir de nome + api.
+      if($connObjs.Count -eq 0){
+        foreach($line in ($txt -split "`r?`n")){
+          # Ex.: "shared-msnweather-123   shared_msnweather   Connected"
+          if($line -match '^(?<name>\S+)\s+(?<api>shared_[a-z0-9_]+)\b'){
+            $name = $Matches['name']
+            $api  = $Matches['api']
+            $rid  = "/providers/Microsoft.PowerApps/apis/$api/connections/$name"
+            [void]$connObjs.Add([pscustomobject]@{
+              apiName      = $api
+              name         = $name
+              connectionId = $rid
+            })
+          }
+        }
+      }
+
+      if($connObjs.Count -eq 0){
+        Write-Host "Saída do PAC:"
+        Write-Host $txt
+        throw "Não foi possível interpretar a saída do 'pac connection list'."
+      }
+
+      # Vincular cada Connection Reference pelo apiName
       $missing = @()
       foreach($cr in ($json.ConnectionReferences | Where-Object { $_ -and -not $_.ConnectionId })) {
         $apiName = $null
@@ -123,27 +164,16 @@ steps:
         }
 
         if([string]::IsNullOrWhiteSpace($apiName)){
-          Write-Warning "Não consegui inferir apiName para [$($cr.LogicalName)]"; 
+          Write-Warning "Não consegui inferir apiName para [$($cr.LogicalName)]"
           $missing += [PSCustomObject]@{ LogicalName = $cr.LogicalName; ApiName = "(desconhecido)" }
           continue
         }
 
-        $match = $conns | Where-Object {
-          ($_.apiName -eq $apiName) -or
-          ($_.connectorId -match [regex]::Escape($apiName)) -or
-          ($_.name -match [regex]::Escape($apiName))
-        } | Select-Object -First 1
-
-        $cid = $null
-        if ($match) {
-          # propriedades comuns: connectionId ou name
-          if ($match.PSObject.Properties.Name -contains 'connectionId') { $cid = $match.connectionId }
-          if (-not $cid -and $match.PSObject.Properties.Name -contains 'name') { $cid = $match.name }
-        }
-
-        if($cid){
-          $cr.ConnectionId = $cid
-          Write-Host "CR [$($cr.LogicalName)] -> $apiName = $cid"
+        # pega a primeira conexão do mesmo apiName (se quiser, refine a seleção)
+        $match = $connObjs | Where-Object { $_.apiName -eq $apiName } | Select-Object -First 1
+        if($match){
+          $cr.ConnectionId = $match.connectionId
+          Write-Host "CR [$($cr.LogicalName)] -> $apiName = $($cr.ConnectionId)"
         } else {
           $missing += [PSCustomObject]@{ LogicalName = $cr.LogicalName; ApiName = $apiName }
         }
@@ -159,6 +189,7 @@ steps:
       } else {
         Write-Host "Todas as Connection References foram vinculadas a conexões existentes."
       }
+
 
 # 6) Importar solução usando o settings preenchido
 - task: PowerPlatformImportSolution@2
