@@ -6,18 +6,27 @@ pool:
 
 # 👇 Ajuste estes valores/variáveis (recomendo usar Variable Group e marcar segredos)
 variables:
-  PowerPlatformSPN: 'Teste-Pipeline-PowerAutomate'     # nome da sua service connection Power Platform (WIF)
-  TargetEnvironmentUrl: 'https://orgb94915f5.crm2.dynamics.com'
+- group: TestSecretPowerAutomate   # <-- traz PP_ClientSecret como segredo
+- name: PowerPlatformSPN
+  value: Teste-Pipeline-PowerAutomate
+- name: TargetEnvironmentUrl
+  value: https://orgb94915f5.crm2.dynamics.com
 
-  # SPN com SECRET só para "discovery" via cmdlets Admin (Secure variables):
-  PP_TenantId: ''      # GUID do tenant
-  PP_AppId: ''         # Application (client) ID
-  PP_ClientSecret: ''  # segredo (secure)
+# SPN usado só para discovery (não secreto):
+- name: PP_TenantId
+  value: a91374ed-f750-4034-857f-03d6783934d8
+- name: PP_AppId
+  value: 4d8f1723-b528-4318-bd65-55bd38a7c554
+# NÃO declare PP_ClientSecret no YAML
 
-  # (Opcional) preferências:
-  PreferOwnerUpn: ''   # se você quer priorizar connections de um UPN específico (ex.: conta de serviço)
-  NoAuthApiNames: 'shared_msnweather'   # conectores sem auth que podem ser criados automaticamente (se Flow provisionador estiver configurado)
-  ProvisionerUrl: ''   # URL do seu Flow provisionador (HTTP) para criar connections "no-auth" (deixe vazio para não tentar criar)
+# Preferências (opcional):
+- name: PreferOwnerUpn
+  value: ''
+- name: NoAuthApiNames
+  value: shared_msnweather
+- name: ProvisionerUrl
+  value: ''
+
 
 steps:
 # 1) PAC no PATH
@@ -26,6 +35,7 @@ steps:
   inputs:
     DefaultVersion: true
     AddToolsToPath: true
+
 
 # 2) Pega o ZIP mais recente
 - task: PowerShell@2
